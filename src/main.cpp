@@ -20,6 +20,21 @@
 // ===================== Configuration générale =====================
 #define SIMULATION false          // true = simulateur; false = capteurs réels
 
+// ---- Modes de fonctionnement ----
+enum FountainMode {
+  MODE_OPEN_CYCLE = 0,   // Actuel : remplissage PIR + pompe auto
+  MODE_CLOSED_CYCLE = 1, // Eau réservoir en continu
+  MODE_ECO_HYBRID = 2    // Remplissage puis 5j fermé avant vidange
+};
+
+FountainMode currentMode = MODE_OPEN_CYCLE;
+
+// Pour le mode Eco/Hybride
+const uint32_t ECO_CLOSED_DURATION_MS = 5UL * 24UL * 3600UL * 1000UL; // 5 jours
+unsigned long ecoModeStartMs = 0; // Instant de passage en cycle fermé
+bool ecoInClosedPhase = false;    // true si en phase fermée
+
+
 // ---- WiFi ----
 const char* WIFI_SSID = "Nian_nian";
 const char* WIFI_PASS = "M@rieK3v";
@@ -131,17 +146,40 @@ static const char index_html[] PROGMEM = R"HTML(
   .pill{padding:3px 8px;border-radius:999px;background:#1f2937;font-size:12px}
   progress{width:100%;height:10px}
   code{background:#0a0f1a;padding:2px 6px;border-radius:6px}
+  .btn{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+  .btn-primary{background:#3b82f6;color:#fff}
+  .btn-primary:hover{background:#2563eb}
+  .btn-secondary{background:#6b7280;color:#fff}
+  .btn-secondary:hover{background:#4b5563}
+  .btn.active{background:#10b981;color:#000}
+  .mode-selector{display:flex;gap:8px;margin-top:8px}
 </style>
 <header>
   <div class="row"><strong>Fontaine</strong></div>
 </header>
 <main class="grid">
+  <div class="card">
+    <div class="title">Dernière actualisation</div>
+    <div class="big" id="lastUpdate">--</div>
+  </div>
+
+  <div class="card">
+    <div class="title">Mode de fonctionnement</div>
+    <div id="currentMode" class="big">Cycle Ouvert</div>
+    <div class="mode-selector">
+      <button class="btn btn-primary" onclick="setMode(0)">Cycle Ouvert</button>
+      <button class="btn btn-secondary" onclick="setMode(1)">Cycle Fermé</button>
+      <button class="btn btn-secondary" onclick="setMode(2)">Eco/Hybride</button>
+    </div>
+    <div id="ecoInfo" style="margin-top:8px;font-size:11px;opacity:0.7"></div>
+  </div>
+
   <div class="card"><div class="title">Niveau de remplissage du réservoir</div>
     <div class="big"><span id="level">–</span>%</div>
     <progress id="lvlbar" max="100" value="0"></progress>
     <div class="row"><span>Distance mesurée:</span><code id="dist">–</code><span>cm</span></div>
   </div>
-
+  
   <div class="card"><div class="title">État</div>
     <div class="row">PIR: <strong id="pir">–</strong></div>
     <div class="row">Électrovanne: <strong id="valve">–</strong></div>
@@ -161,33 +199,64 @@ static const char index_html[] PROGMEM = R"HTML(
 
 </main>
 <script>
+const modeNames = ['Cycle Ouvert', 'Cycle Fermé', 'Eco/Hybride'];
+
+function setMode(m) {
+  fetch('/setmode?mode=' + m)
+    .then(r => r.text())
+    .then(() => {
+      document.querySelectorAll('.mode-selector .btn').forEach((btn, i) => {
+        btn.className = 'btn ' + (i === m ? 'btn-primary active' : 'btn-secondary');
+      });
+    });
+}
+
 const es = new EventSource('/events');
 es.onmessage = e => {
   try{
     const d = JSON.parse(e.data);
     const $ = id => document.getElementById(id);
     
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('fr-FR');
+  const dateStr = now.toLocaleDateString('fr-FR');
+  document.getElementById('lastUpdate').textContent = `${dateStr} ${timeStr}`; 
+
+    // Mode
+    const mode = d.mode ?? 0;
+    $('currentMode').textContent = modeNames[mode];
+    document.querySelectorAll('.mode-selector .btn').forEach((btn, i) => {
+      btn.className = 'btn ' + (i === mode ? 'btn-primary active' : 'btn-secondary');
+    });
+    
+    // Info Eco
+    if (mode === 2 && d.ecoInClosedPhase) {
+      $('ecoInfo').textContent = 'Phase fermée active (5 jours)';
+    } else {
+      $('ecoInfo').textContent = '';
+    }
+    
     $('level').textContent = d.level;
     $('lvlbar').value = d.level;
     $('dist').textContent = d.distance.toFixed(1);
     $('temp').textContent = d.temp?.toFixed(1);
-
+    
     const temp = d.temp ?? 20;
     const tempEl = $('temp');
     if (temp > 30) {
-      tempEl.style.background = '#dc2626';  // Rouge >30°C
+      tempEl.style.background = '#dc2626';
       tempEl.style.color = '#fff';
       tempEl.style.padding = '2px 6px';
       tempEl.style.borderRadius = '4px';
       tempEl.style.fontWeight = 'bold';
     } else if (temp > 25) {
-      tempEl.style.background = '#f59e0b';  // Orange 25-30°C
+      tempEl.style.background = '#f59e0b';
       tempEl.style.color = '#000';
       tempEl.style.padding = '2px 6px';
       tempEl.style.borderRadius = '4px';
       tempEl.style.fontWeight = 'bold';
     } else if (temp < 15) {
-      tempEl.style.background = '#3b82f6';  // Bleu <15°C
+      tempEl.style.background = '#3b82f6';
       tempEl.style.color = '#fff';
       tempEl.style.padding = '2px 6px';
       tempEl.style.borderRadius = '4px';
@@ -199,7 +268,6 @@ es.onmessage = e => {
       tempEl.style.fontWeight = '';
     }
     
-    // ===== HUMIDITÉ AVEC ALERTE >65% =====
     const hum = d.hum ?? 0;
     const humEl = $('hum');
     humEl.textContent = hum.toFixed(0);
@@ -220,12 +288,10 @@ es.onmessage = e => {
     $('valve').textContent = d.valve ? 'ON' : 'OFF';
     $('pump').textContent  = d.pump  ? 'ON' : 'OFF';
     
-    // ===== DERNIÈRE DÉTECTION PIR AVEC ALERTE >6H =====
     const sincePir = d.sincePir || '--:--:--';
     const sincePirEl = $('sincePir');
     sincePirEl.textContent = sincePir;
     
-    // Convertir HH:MM:SS en heures
     if (sincePir !== '--:--:--') {
       const parts = sincePir.split(':');
       const hours = parseInt(parts[0]) || 0;
@@ -411,9 +477,7 @@ void runLogic(unsigned long dtMs) {
   bool pir = readPir();
   pirState = pir;
   if (pir) {
-    // étend l'autorisation comme avant
     fillAllowedUntilMs = now + (unsigned long)MOTION_HOLD_SECONDS * 1000UL;
-    // mémorise l'instant de la dernière détection
     lastPirDetectMs = now;
   }
   bool fillAuthorized = (long)fillAllowedUntilMs - (long)now > 0;
@@ -424,44 +488,97 @@ void runLogic(unsigned long dtMs) {
   int levelNow = cmToPercent(distanceCm);
   if (!SIMULATION) levelPct = levelNow;
 
-  // 3) Décisions relais
+  // 3) Décisions relais SELON LE MODE
   bool prevValve = valveOn;
   bool prevPump  = pumpOn;
+  bool prevVout  = VoutOn;
 
-  if (levelNow >= PUMP_ON_ABOVE)      pumpOn = true;
-  else if (levelNow <= PUMP_OFF_BELOW) pumpOn = false;
+  switch (currentMode) {
+    
+    case MODE_OPEN_CYCLE: // Mode actuel
+      if (levelNow >= PUMP_ON_ABOVE)       pumpOn = true;
+      else if (levelNow <= PUMP_OFF_BELOW) pumpOn = false;
+      
+      if (fillAuthorized && levelNow < LEVEL_TARGET_FILL) valveOn = true;
+      else valveOn = false;
+      
+      VoutOn = false;
+      break;
 
-  if (fillAuthorized && levelNow < LEVEL_TARGET_FILL) valveOn = true;
-  else valveOn = false;
-  
-  // --- Détection des "allumages" (front montant)
+    case MODE_CLOSED_CYCLE: // Fontaine classique
+      valveOn = false;
+      pumpOn = true;
+      VoutOn = false;
+      break;
+
+    case MODE_ECO_HYBRID:
+      // Phase 1 : remplissage comme en cycle ouvert
+      if (!ecoInClosedPhase) {
+        if (levelNow < LEVEL_TARGET_FILL && fillAuthorized) {
+          valveOn = true;
+        } else {
+          valveOn = false;
+        }
+        
+        // Quand réservoir atteint le seuil, passer en phase fermée
+        if (levelNow >= LEVEL_TARGET_FILL) {
+          ecoInClosedPhase = true;
+          ecoModeStartMs = now;
+        }
+        
+        // Pompe suit la logique normale
+        if (levelNow >= PUMP_ON_ABOVE)       pumpOn = true;
+        else if (levelNow <= PUMP_OFF_BELOW) pumpOn = false;
+        
+        VoutOn = false;
+      }
+      // Phase 2 : cycle fermé pendant 5 jours
+      else {
+        valveOn = false;
+        pumpOn = true;
+        VoutOn = false;
+        
+        // Après 5 jours : vidange (ouvrir Vout 30s) puis recommencer
+        if (now - ecoModeStartMs >= ECO_CLOSED_DURATION_MS) {
+          VoutOn = true;
+          delay(30000); // Vidange 30 secondes (bloquant)
+          VoutOn = false;
+          
+          // Réinitialiser pour recommencer phase remplissage
+          ecoInClosedPhase = false;
+          levelPct = 0; // En simulation
+        }
+      }
+      break;
+  }
+
+  // 4) Appliquer les changements
   if (valveOn && !prevValve) {
     lastValveOnMs = now;
-    pulseEV1(true);  // OUVRIR EV1
+    pulseEV1(true);
   }
   if (!valveOn && prevValve) {
-    pulseEV1(false); // FERMER EV1
+    pulseEV1(false);
   }
   
   if (pumpOn && !prevPump) {
     lastPumpOnMs = now;
   }
 
-  // 4) Appliquer
   setPump(pumpOn);
   setEV_out(VoutOn);
-  //setRelay(PIN_PUMP,  pumpOn);
-  //setRelay(PIN_VALVE, valveOn);
 
   // 5) Évolution simulation
   if (SIMULATION) {
     float dt = dtMs / 1000.0f;
     if (valveOn) levelPct += SIM_FILL_RATE_PCT_S  * dt;
     if (pumpOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * dt;
+    if (VoutOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * 2.0f * dt; // Vidange plus rapide
     levelPct -= SIM_LEAK_RATE_PCT_S * dt;
     levelPct = constrain(levelPct, 0.0f, 100.0f);
   }
 }
+
 
 void drawOLED() {
   display.clearDisplay();
@@ -518,7 +635,7 @@ String agoFrom(unsigned long whenMs) {
 
 String statusJson() {
   // JSON sans ArduinoJson pour rester léger
-  char buf[384];
+  char buf[512];
   bool fillAuth = (long)fillAllowedUntilMs - (long)millis() > 0;
   
   String sincePir = agoFrom(lastPirDetectMs);
@@ -537,9 +654,11 @@ String statusJson() {
       "\"sincePir\":\"%s\","
       "\"lastValveOnAgo\":\"%s\","
       "\"lastPumpOnAgo\":\"%s\","
-      "\"uptime\":\"%s\""
+      "\"uptime\":\"%s\","
+      "\"mode\":%d,"
+      "\"ecoInClosedPhase\":%d"
     "}",
-    (int)round(levelPct), distanceCm, temperatureC, humidityPct, pirState?1:0, valveOn?1:0, pumpOn?1:0, sincePir.c_str(), lastValveOnAgo.c_str(), lastPumpOnAgo.c_str(), uptimeStr().c_str()
+    (int)round(levelPct), distanceCm, temperatureC, humidityPct, pirState?1:0, valveOn?1:0, pumpOn?1:0, sincePir.c_str(), lastValveOnAgo.c_str(), lastPumpOnAgo.c_str(), uptimeStr().c_str(), currentMode, ecoInClosedPhase?1:0
   );
   return String(buf);
 }
@@ -687,6 +806,26 @@ void setup() {
     String js = statusJson();
     request->send(200, "application/json", js);
   });
+
+  server.on("/setmode", HTTP_GET, [](AsyncWebServerRequest* request){
+  if (request->hasParam("mode")) {
+    int m = request->getParam("mode")->value().toInt();
+    if (m >= 0 && m <= 2) {
+      currentMode = (FountainMode)m;
+      
+      // Réinitialiser les états du mode Eco si on change
+      if (currentMode != MODE_ECO_HYBRID) {
+        ecoInClosedPhase = false;
+      }
+      
+      request->send(200, "text/plain", "Mode changé");
+    } else {
+      request->send(400, "text/plain", "Mode invalide");
+    }
+  } else {
+    request->send(400, "text/plain", "Paramètre manquant");
+  }
+});
 
   server.begin();
 
