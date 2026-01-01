@@ -603,44 +603,17 @@ void drawOLED() {
   // Icône 20x15 à (0,0) — respecte la contrainte "≤15 px"
   display.drawBitmap(SCREEN_WIDTH - 20, 0, icon, 20, 15, SSD1306_WHITE);
 
-  // --- "eco" en petit en haut à gauche si mode ECO_HYBRID ---
-  if (currentMode == MODE_ECO_HYBRID) {
-    display.setTextSize(1);  // Petit texte (8px hauteur)
-    display.setCursor((SCREEN_WIDTH - 18) / 2, 0); //centré
-    display.print("eco");
-  }
+  // --- Niveau d'eau en gros + barre ---
+  display.setTextSize(2);              // 16 px
+  display.setCursor(0, 24);
+  display.print("Level: ");
+  display.print((int)round(levelPct));
+  display.print("%");
 
-  // --- Image 52x52 en bas à gauche selon le mode ---
-  const unsigned char* modeIcon;
-  if (currentMode == MODE_CLOSED_CYCLE) {
-    modeIcon = bac;  // Cycle fermé
-  } else if (currentMode == MODE_ECO_HYBRID) {
-    // Mode éco : afficher selon la phase
-    if (ecoInClosedPhase) {
-      modeIcon = bac;  // Phase fermée = bac
-    } else {
-      modeIcon = robinet;  // Phase remplissage = robinet
-    }
-  } else {
-    modeIcon = robinet;  // Cycle ouvert
-  }
-  
-  // Position : bas gauche (y = 64 - 52 = 12)
-  display.drawBitmap(0, 12, modeIcon, 52, 52, SSD1306_WHITE);
-
-  // --- Niveau d'eau en petit en bas à droite ---
-  display.setTextSize(2);  // Petit texte (8px hauteur)
-  
-  // Créer le texte du niveau
-  char levelText[8];
-  snprintf(levelText, sizeof(levelText), "%d%%", (int)round(levelPct));
-  
-  // Calculer largeur approximative du texte (6 pixels par caractère en taille 1)
-  int textWidth = strlen(levelText) * 12;
-  
-  // Position : à droite de l'image du mode
-  display.setCursor(SCREEN_WIDTH - textWidth - 20, SCREEN_HEIGHT - 20);
-  display.print(levelText);
+  int barX=0, barY=50, barW=128, barH=12;
+  display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
+  int fillW = map((int)round(levelPct), 0, 100, 0, barW-2);
+  display.fillRect(barX+1, barY+1, fillW, barH-2, SSD1306_WHITE);
 
   display.display();
 }
