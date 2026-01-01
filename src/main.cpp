@@ -68,7 +68,7 @@ Adafruit_AHTX0 aht;
 const int PIN_ECHO  = 12;   // HC-SR04 ECHO (si réel)
 const int PIN_TRIG  = 13;   // HC-SR04 TRIG (si réel)
 const int PIN_PIR   = 14;   // SR602 (si réel)
-const int PIN_VALVE = 18;   // Relais EV out
+const int PIN_VALVE = 18;   // Relais EV_out
 const int PIN_PUMP  = 19;   // Relais pompe + ancienne EV
 const bool ACTIVE_LOW = true; // true si relais actifs à LOW
 const int PIN_EV1_AIN1 = 33; // EV1
@@ -86,9 +86,9 @@ const int EV_PULSE_MS = 50; // durée impulsion électrovanne bistable
 const float TANK_HEIGHT_CM   = 9.1; // hauteur utile d'eau
 const float SENSOR_OFFSET_CM = 2.0;  // distance min capteur->surface pleine
 
-const int LEVEL_TARGET_FILL  = 95; // % à atteindre quand remplissage autorisé
-const int PUMP_ON_ABOVE      = 90; // % déclenche pompe au-dessus
-const int PUMP_OFF_BELOW     = 40; // % arrêt pompe en redescendant
+const int LEVEL_TARGET_FILL  = 90; // % à atteindre quand remplissage autorisé
+const int PUMP_ON_ABOVE      = 85; // % déclenche pompe au-dessus
+const int PUMP_OFF_BELOW     = 25; // % arrêt pompe en redescendant
 const int MOTION_HOLD_SECONDS= 3; // s d'autorisation après détection
 
 // ---- Simulation ----
@@ -496,13 +496,18 @@ void runLogic(unsigned long dtMs) {
   switch (currentMode) {
     
     case MODE_OPEN_CYCLE: // Mode actuel
-      if (levelNow >= PUMP_ON_ABOVE)       pumpOn = true;
-      else if (levelNow <= PUMP_OFF_BELOW) pumpOn = false;
+      if (levelNow >= PUMP_ON_ABOVE){       
+        pumpOn = true;
+        VoutOn = true;
+      }
+      else if (levelNow <= PUMP_OFF_BELOW){
+        pumpOn = false;
+        VoutOn = false;
+      }
       
       if (fillAuthorized && levelNow < LEVEL_TARGET_FILL) valveOn = true;
       else valveOn = false;
       
-      VoutOn = false;
       break;
 
     case MODE_CLOSED_CYCLE: // Fontaine classique
@@ -538,42 +543,48 @@ void runLogic(unsigned long dtMs) {
         pumpOn = true;
         VoutOn = false;
         
-        // Après 5 jours : vidange (ouvrir Vout 30s) puis recommencer
+        // Après 5 jours : vidange puis recommencer
         if (now - ecoModeStartMs >= ECO_CLOSED_DURATION_MS) {
+          pumpOn = true;
           VoutOn = true;
-          delay(30000); // Vidange 30 secondes (bloquant)
-          VoutOn = false;
-          
-          // Réinitialiser pour recommencer phase remplissage
-          ecoInClosedPhase = false;
-          levelPct = 0; // En simulation
+          // Condition de sortie : niveau bas atteint (10%)
+          if (levelNow <= 10) {
+            pumpOn = false;
+            VoutOn = false;
+            ecoInClosedPhase = false;
+            if (SIMULATION) levelPct = 10;
+          }
         }
       }
       break;
   }
 
   // 4) Appliquer les changements
-  if (valveOn && !prevValve) {
-    lastValveOnMs = now;
-    pulseEV1(true);
-  }
-  if (!valveOn && prevValve) {
-    pulseEV1(false);
+  if (valveOn != prevValve) {
+    if (valveOn) {
+      pulseEV1(true);
+      lastValveOnMs = now;
+    } else {
+      pulseEV1(false);
+    }
   }
   
-  if (pumpOn && !prevPump) {
-    lastPumpOnMs = now;
+  // Pompe : appliquer si changement
+  if (pumpOn != prevPump) {
+    setPump(pumpOn);
+    if (pumpOn) lastPumpOnMs = now;
   }
-
-  setPump(pumpOn);
-  setEV_out(VoutOn);
+  // Vout : appliquer si changement
+  if (VoutOn != prevVout) {
+    setEV_out(VoutOn);
+  }
 
   // 5) Évolution simulation
   if (SIMULATION) {
     float dt = dtMs / 1000.0f;
-    if (valveOn) levelPct += SIM_FILL_RATE_PCT_S  * dt;
+    if (valveOn) levelPct += SIM_FILL_RATE_PCT_S * dt;
     if (pumpOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * dt;
-    if (VoutOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * 2.0f * dt; // Vidange plus rapide
+    if (VoutOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * 2.0f * dt;
     levelPct -= SIM_LEAK_RATE_PCT_S * dt;
     levelPct = constrain(levelPct, 0.0f, 100.0f);
   }
@@ -723,7 +734,7 @@ void setup() {
   setCpuFrequencyMhz(80);
 
   // GPIO
-  //pinMode(PIN_VALVE, OUTPUT);
+  pinMode(PIN_VALVE, OUTPUT);
   pinMode(PIN_PUMP,  OUTPUT);
   pulseEV1(false);
   setPump(false);
@@ -817,6 +828,14 @@ void setup() {
       if (currentMode != MODE_ECO_HYBRID) {
         ecoInClosedPhase = false;
       }
+      
+      // NOUVEAU : Forcer un état propre lors du changement de mode
+      valveOn = false;
+      pumpOn = false;
+      VoutOn = false;
+      pulseEV1(false);
+      setPump(false);
+      setEV_out(false);
       
       request->send(200, "text/plain", "Mode changé");
     } else {
