@@ -16,6 +16,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <EEPROM.h>
+#include <time.h>
 #include "icons.h"
 
 // ===================== EEPROM =====================
@@ -23,6 +24,7 @@
 #define EEPROM_MODE_ADDR 0
 #define EEPROM_MAGIC_ADDR 1
 #define EEPROM_MAGIC_VALUE 0xA5
+#define EEPROM_TIMESTAMP_ADDR 2
 
 // ===================== Configuration générale =====================
 #define SIMULATION false          // true = simulateur; false = capteurs réels
@@ -37,9 +39,9 @@ enum FountainMode {
 FountainMode currentMode = MODE_CLOSED_CYCLE;
 
 // Pour le mode Eco/Hybride
-const uint32_t ECO_CLOSED_DURATION_MS = 5UL * 24UL * 3600UL * 1000UL; // 5 jours
-unsigned long ecoModeStartMs = 0; // Instant de passage en cycle fermé
-bool ecoInClosedPhase = false;    // true si en phase fermée
+const uint32_t ECO_DRAIN_INTERVAL_SEC = 5UL * 24UL * 3600UL; // 5 jours en secondes
+uint32_t lastEV1OnTimestamp = 0;  // timestamp epoch (secondes depuis 1970)
+bool ecoInClosedPhase = false;
 
 
 // ---- WiFi ----
@@ -51,6 +53,12 @@ IPAddress gateway (192,168,1,1);
 IPAddress subnet  (255,255,255,0);
 IPAddress dns1    (192,168,1,1);     // ou 8.8.8.8 / 1.1.1.1
 IPAddress dns2    (1,1,1,1); */
+
+// ---- NTP ----
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET_SEC = 3600;        // GMT+1 (France hiver)
+const int   DAYLIGHT_OFFSET_SEC = 3600;   // +1h si heure d'été
+
 
 // === Google Web App ===
 const char* GSCRIPT_URL   = "https://script.google.com/macros/s/AKfycbyBtQMShESVRcuFGqsJnEIWSeQ_uYQmR2UhtKyw1khbzB0H2wi5ZUAXzZn7pZnJUOdY7g/exec";
@@ -375,6 +383,26 @@ FountainMode loadModeFromEEPROM() {
   return (FountainMode)mode;
 }
 
+void saveEV1TimestampToEEPROM(uint32_t timestamp) {
+  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 0, (timestamp >> 24) & 0xFF);
+  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 1, (timestamp >> 16) & 0xFF);
+  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 2, (timestamp >> 8) & 0xFF);
+  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 3, timestamp & 0xFF);
+  EEPROM.commit();
+}
+
+uint32_t loadEV1TimestampFromEEPROM() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
+    return 0;
+  }
+  uint32_t timestamp = 0;
+  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 0)) << 24;
+  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 1)) << 16;
+  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 2)) << 8;
+  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 3));
+  return timestamp;
+}
+
 int rssiToQuality(int rssiDbm) {
   // approx: -50 dBm => ~100%, -100 dBm => ~0%
   int q = map(constrain(rssiDbm, -100, -50), -100, -50, 0, 100);
@@ -545,46 +573,44 @@ void runLogic(unsigned long dtMs) {
       break;
 
     case MODE_ECO_HYBRID:
-      // Phase 1 : remplissage comme en cycle ouvert
-      if (!ecoInClosedPhase) {
-        if (levelNow < LEVEL_TARGET_FILL && fillAuthorized) {
-          valveOn = true;
-        } else {
-          valveOn = false;
-        }
-        
-        // Quand réservoir atteint le seuil, passer en phase fermée
-        if (levelNow >= LEVEL_TARGET_FILL) {
-          ecoInClosedPhase = true;
-          ecoModeStartMs = now;
-        }
-        
-        // Pompe suit la logique normale
-        if (levelNow >= PUMP_ON_ABOVE)       pumpOn = true;
-        else if (levelNow <= PUMP_OFF_BELOW) pumpOn = false;
-        
-        VoutOn = false;
-      }
-      // Phase 2 : cycle fermé pendant 5 jours
-      else {
+  // Phase 1 : Remplissage automatique jusqu'à 90% (sans PIR)
+    if (!ecoInClosedPhase) {
+      if (levelNow < LEVEL_TARGET_FILL) {
+        valveOn = true;
+      } else {
         valveOn = false;
+        // Basculer en cycle fermé dès que 90% atteint
+        ecoInClosedPhase = true;
+      }
+      
+      pumpOn = false;
+      VoutOn = false;
+    }
+    // Phase 2 : Cycle fermé + vidange tous les 5 jours
+    else {
+      valveOn = false;
+      pumpOn = true;
+      VoutOn = false;
+      
+      // Vérifier si 5 jours écoulés depuis dernier remplissage
+      uint32_t currentTimestamp = (uint32_t)time(nullptr);
+      uint32_t elapsedSec = currentTimestamp - lastEV1OnTimestamp;
+      
+      if (elapsedSec >= ECO_DRAIN_INTERVAL_SEC) {
+        // Vidange active
         pumpOn = true;
-        VoutOn = false;
+        VoutOn = true;
         
-        // Après 5 jours : vidange puis recommencer
-        if (now - ecoModeStartMs >= ECO_CLOSED_DURATION_MS) {
-          pumpOn = true;
-          VoutOn = true;
-          // Condition de sortie : niveau bas atteint (10%)
-          if (levelNow <= 10) {
-            pumpOn = false;
-            VoutOn = false;
-            ecoInClosedPhase = false;
-            if (SIMULATION) levelPct = 10;
-          }
+        // Condition de sortie : niveau bas (10%)
+        if (levelNow <= 10) {
+          pumpOn = false;
+          VoutOn = false;
+          ecoInClosedPhase = false;  // Retour phase remplissage
+          if (SIMULATION) levelPct = 10;
         }
       }
-      break;
+    }
+    break;
   }
 
   // 4) Appliquer les changements
@@ -592,6 +618,9 @@ void runLogic(unsigned long dtMs) {
     if (valveOn) {
       pulseEV1(true);
       lastValveOnMs = now;
+      // Sauvegarder timestamp pour mode Eco
+      lastEV1OnTimestamp = (uint32_t)time(nullptr);
+      saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
     } else {
       pulseEV1(false);
     }
@@ -777,6 +806,7 @@ void setup() {
   // ========== Initialisation EEPROM ==========
   EEPROM.begin(EEPROM_SIZE);
   currentMode = loadModeFromEEPROM();
+  lastEV1OnTimestamp = loadEV1TimestampFromEEPROM();
 
   // ========== Détection GPIO0 (bouton BOOT) ==========
   pinMode(0, INPUT_PULLUP);
@@ -855,6 +885,16 @@ void setup() {
   } else {
     Serial.println(F("WiFi non connecté."));
   }
+  
+  // Configuration NTP
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  Serial.print(F("Synchronisation NTP..."));
+  int ntpRetry = 0;
+  while (time(nullptr) < 100000 && ntpRetry < 20) {
+    delay(500);
+    Serial.print(".");
+    ntpRetry++;
+  }
 
   // Pour réduire la temperature carte
   WiFi.setTxPower(WIFI_POWER_8_5dBm); // limiter le débit wifi
@@ -889,6 +929,12 @@ void setup() {
       if (currentMode != MODE_ECO_HYBRID) {
         ecoInClosedPhase = false;
       }
+      if (currentMode == MODE_ECO_HYBRID) {
+        // Réinitialiser le cycle Eco (nouveau départ)
+        lastEV1OnTimestamp = (uint32_t)time(nullptr);
+        saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
+      }
+
       
       // NOUVEAU : Forcer un état propre lors du changement de mode
       valveOn = false;
