@@ -15,7 +15,14 @@
 #include <ESPAsyncWebServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <EEPROM.h>
 #include "icons.h"
+
+// ===================== EEPROM =====================
+#define EEPROM_SIZE 64
+#define EEPROM_MODE_ADDR 0
+#define EEPROM_MAGIC_ADDR 1
+#define EEPROM_MAGIC_VALUE 0xA5
 
 // ===================== Configuration générale =====================
 #define SIMULATION false          // true = simulateur; false = capteurs réels
@@ -27,7 +34,7 @@ enum FountainMode {
   MODE_ECO_HYBRID = 2    // Remplissage puis 5j fermé avant vidange
 };
 
-FountainMode currentMode = MODE_OPEN_CYCLE;
+FountainMode currentMode = MODE_CLOSED_CYCLE;
 
 // Pour le mode Eco/Hybride
 const uint32_t ECO_CLOSED_DURATION_MS = 5UL * 24UL * 3600UL * 1000UL; // 5 jours
@@ -345,6 +352,27 @@ void pulseEV1(bool open) {
   digitalWrite(PIN_EV1_PWMA, LOW);
   digitalWrite(PIN_EV1_AIN1, LOW);
   digitalWrite(PIN_EV1_AIN2, LOW);
+}
+
+void saveModeToEEPROM(FountainMode mode) {
+  EEPROM.write(EEPROM_MODE_ADDR, (uint8_t)mode);
+  EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
+  EEPROM.commit();
+}
+
+FountainMode loadModeFromEEPROM() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
+    // EEPROM jamais initialisée
+    saveModeToEEPROM(MODE_CLOSED_CYCLE);
+    return MODE_CLOSED_CYCLE;
+  }
+  uint8_t mode = EEPROM.read(EEPROM_MODE_ADDR);
+  if (mode > 2) {
+    // Valeur corrompue
+    saveModeToEEPROM(MODE_CLOSED_CYCLE);
+    return MODE_CLOSED_CYCLE;
+  }
+  return (FountainMode)mode;
 }
 
 int rssiToQuality(int rssiDbm) {
@@ -746,6 +774,10 @@ void pushToGoogleSheet() {
 void setup() {
   Serial.begin(115200);
 
+  // ========== Initialisation EEPROM ==========
+  EEPROM.begin(EEPROM_SIZE);
+  currentMode = loadModeFromEEPROM();
+
   // ========== Détection GPIO0 (bouton BOOT) ==========
   pinMode(0, INPUT_PULLUP);
   delay(100);
@@ -850,7 +882,9 @@ void setup() {
     int m = request->getParam("mode")->value().toInt();
     if (m >= 0 && m <= 2) {
       currentMode = (FountainMode)m;
-      
+      // Sauvegarde en EEPROM
+        saveModeToEEPROM(currentMode);
+
       // Réinitialiser les états du mode Eco si on change
       if (currentMode != MODE_ECO_HYBRID) {
         ecoInClosedPhase = false;
