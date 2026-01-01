@@ -39,9 +39,12 @@ enum FountainMode {
 FountainMode currentMode = MODE_CLOSED_CYCLE;
 
 // Pour le mode Eco/Hybride
-const uint32_t ECO_DRAIN_INTERVAL_SEC = 5UL * 24UL * 3600UL; // 5 jours en secondes
 uint32_t lastEV1OnTimestamp = 0;  // timestamp epoch (secondes depuis 1970)
 bool ecoInClosedPhase = false;
+uint32_t ecoDrainIntervalSec = 5UL * 24UL * 3600UL; // Modifiable via web
+String ecoDrainUnit = "days"; // "hours" ou "days"
+uint32_t ecoDrainValue = 5;   // Valeur affichée (5 jours ou X heures)
+bool manualDrainActive = false; // Vidange manuelle
 
 
 // ---- WiFi ----
@@ -167,51 +170,74 @@ static const char index_html[] PROGMEM = R"HTML(
   .btn-secondary{background:#6b7280;color:#fff}
   .btn-secondary:hover{background:#4b5563}
   .btn.active{background:#10b981;color:#000}
+  .btn-danger{background:#dc2626;color:#fff}
+  .btn-danger:hover{background:#b91c1c}
   .mode-selector{display:flex;gap:8px;margin-top:8px}
+  input[type=number]{background:#1f2937;color:#fff;border:1px solid #374151;padding:6px;border-radius:6px;width:60px}
 </style>
 <header>
-  <div class="row"><strong>Fontaine</strong></div>
+  <div class="row"><strong>Fontaine</strong> (<span id="lastUpdate">--</span>)</div>
 </header>
 <main class="grid">
   <div class="card">
-    <div class="title">Dernière actualisation</div>
-    <div class="big" id="lastUpdate">--</div>
-  </div>
-
-  <div class="card">
     <div class="title">Mode de fonctionnement</div>
-    <div id="currentMode" class="big">Cycle Ouvert</div>
+    <div id="currentMode" class="big" style="display:none" >Cycle Ouvert</div>
     <div class="mode-selector">
       <button class="btn btn-primary" onclick="setMode(0)">Cycle Ouvert</button>
       <button class="btn btn-secondary" onclick="setMode(1)">Cycle Fermé</button>
       <button class="btn btn-secondary" onclick="setMode(2)">Eco/Hybride</button>
     </div>
     <div id="ecoInfo" style="margin-top:8px;font-size:11px;opacity:0.7"></div>
+    <div id="ecoConfig" style="display:none;margin-top:12px">
+      <div class="row">
+        <span>Vidange tous les</span>
+        <input type="number" id="ecoValue" min="1" max="720" value="5">
+        <select id="ecoUnit" style="background:#1f2937;color:#fff;border:1px solid #374151;padding:6px;border-radius:6px">
+          <option value="hours">heures</option>
+          <option value="days" selected>jours</option>
+        </select>
+        <button class="btn btn-secondary" onclick="setInterval()">OK</button>
+      </div>
+    </div>
+
   </div>
 
-  <div class="card"><div class="title">Niveau de remplissage du réservoir</div>
+  <div class="card">
+    <div class="title">Niveau de remplissage du réservoir</div>
     <div class="big"><span id="level">–</span>%</div>
     <progress id="lvlbar" max="100" value="0"></progress>
     <div class="row"><span>Distance mesurée:</span><code id="dist">–</code><span>cm</span></div>
   </div>
   
-  <div class="card"><div class="title">État</div>
+  <div class="card">
+    <div class="title">État</div>
     <div class="row">PIR: <strong id="pir">–</strong></div>
     <div class="row">Électrovanne: <strong id="valve">–</strong></div>
     <div class="row">Pompe: <strong id="pump">–</strong></div>
   </div>
-
-  <div class="card"><div class="title">Historique</div>
-    <div class="row">Depuis dernière détection PIR: <strong id="sincePir">–:–:–</strong></div>
-    <div class="row">Dernier allumage électrovanne: <strong id="lastValveOnAgo">–:–:–</strong></div>
-    <div class="row">Dernier allumage pompe: <strong id="lastPumpOnAgo">–:–:–</strong></div>
-  </div>
   
-  <div class="card"><div class="title">Climat</div>
+  <div class="card">
+    <div class="title">Climat</div>
     <div class="row"><span>Température:</span><code id="temp">–</code><span>°C</span></div>
     <div class="row"><span>Humidité:</span><code id="hum">–</code><span>%</span></div>
   </div>
 
+  <div class="card">
+    <div class="title">Historique</div>
+    <div class="row">Depuis dernière détection PIR: <strong id="sincePir">–:–:–</strong></div>
+    <div class="row">Dernier allumage électrovanne: <strong id="lastValveOnAgo">–:–:–</strong></div>
+    <div class="row">Dernier allumage pompe: <strong id="lastPumpOnAgo">–:–:–</strong></div>
+    <div class="row">Prochaine vidange: <strong id="nextDrain">–:–:–</strong></div> 
+  </div>
+  
+  <div class="card">
+    <div class="title">Vidange manuelle</div>
+    <div class="row" style="gap:12px">
+      <button class="btn btn-danger" onclick="startDrain()">Démarrer vidange</button>
+      <button class="btn btn-secondary" onclick="stopDrain()">Arrêter</button>
+    </div>
+    <div id="drainStatus" style="margin-top:8px;font-size:12px"></div>
+  </div>
 </main>
 <script>
 const modeNames = ['Cycle Ouvert', 'Cycle Fermé', 'Eco/Hybride'];
@@ -226,16 +252,35 @@ function setMode(m) {
     });
 }
 
+function setInterval() {
+  const value = document.getElementById('ecoValue').value;
+  const unit = document.getElementById('ecoUnit').value;
+  fetch('/setinterval?value=' + value + '&unit=' + unit)
+    .then(r => r.text())
+    .then(txt => alert(txt === 'OK' ? 'Intervalle modifié' : txt));
+}
+
+
+function startDrain() {
+  if (confirm('Démarrer la vidange ?')) {
+    fetch('/drain').then(() => alert('Vidange démarrée'));
+  }
+}
+
+function stopDrain() {
+  fetch('/stopdrain').then(() => alert('Vidange arrêtée'));
+}
+
 const es = new EventSource('/events');
 es.onmessage = e => {
   try{
     const d = JSON.parse(e.data);
     const $ = id => document.getElementById(id);
     
-  const now = new Date();
-  const timeStr = now.toLocaleTimeString('fr-FR');
-  const dateStr = now.toLocaleDateString('fr-FR');
-  document.getElementById('lastUpdate').textContent = `${dateStr} ${timeStr}`; 
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('fr-FR');
+    const dateStr = now.toLocaleDateString('fr-FR');
+    $('lastUpdate').textContent = `${dateStr} ${timeStr}`;
 
     // Mode
     const mode = d.mode ?? 0;
@@ -244,11 +289,30 @@ es.onmessage = e => {
       btn.className = 'btn ' + (i === mode ? 'btn-primary active' : 'btn-secondary');
     });
     
+    // Config Eco visible uniquement en mode 2
+    const ecoConfig = $('ecoConfig');
+    if (mode === 2) {
+      ecoConfig.style.display = 'block';
+      $('ecoValue').value = d.ecoDrainValue || 5;
+      $('ecoUnit').value = d.ecoDrainUnit || 'days';
+    } else {
+      ecoConfig.style.display = 'none';
+    }
+
+    
     // Info Eco
     if (mode === 2 && d.ecoInClosedPhase) {
-      $('ecoInfo').textContent = 'Phase fermée active (5 jours)';
+      $('ecoInfo').textContent = 'Phase fermée active (' + (d.ecoDrainDays || 5) + ' jours)';
     } else {
       $('ecoInfo').textContent = '';
+    }
+
+    // Statut vidange
+    if (d.manualDrain) {
+      $('drainStatus').textContent = '⚠️ Vidange en cours...';
+      $('drainStatus').style.color = '#f59e0b';
+    } else {
+      $('drainStatus').textContent = '';
     }
     
     $('level').textContent = d.level;
@@ -283,35 +347,18 @@ es.onmessage = e => {
       tempEl.style.fontWeight = '';
     }
     
-    const hum = d.hum ?? 0;
-    const humEl = $('hum');
-    humEl.textContent = hum.toFixed(0);
-    if (hum > 65) {
-      humEl.style.background = '#dc2626';
-      humEl.style.color = '#fff';
-      humEl.style.padding = '2px 6px';
-      humEl.style.borderRadius = '4px';
-      humEl.style.fontWeight = 'bold';
-    } else {
-      humEl.style.background = '';
-      humEl.style.color = '';
-      humEl.style.padding = '';
-      humEl.style.fontWeight = '';
-    }
-    
-    $('pir').textContent = d.pir ? 'ACTIF' : 'inactif';
-    $('valve').textContent = d.valve ? 'ON' : 'OFF';
-    $('pump').textContent  = d.pump  ? 'ON' : 'OFF';
+    $('hum').textContent = d.humidity?.toFixed(1);
+    $('pir').textContent = d.pir ? 'Détecté' : 'Aucun';
+    $('valve').textContent = d.valve ? 'Ouverte' : 'Fermée';
+    $('pump').textContent = d.pump ? 'Active' : 'Arrêtée';
     
     const sincePir = d.sincePir || '--:--:--';
+    $('sincePir').textContent = sincePir;
     const sincePirEl = $('sincePir');
-    sincePirEl.textContent = sincePir;
-    
     if (sincePir !== '--:--:--') {
-      const parts = sincePir.split(':');
-      const hours = parseInt(parts[0]) || 0;
-      
-      if (hours >= 6) {
+      const [h,m,s] = sincePir.split(':').map(Number);
+      const totalSec = h*3600 + m*60 + s;
+      if (totalSec > 3600) {
         sincePirEl.style.background = '#dc2626';
         sincePirEl.style.color = '#fff';
         sincePirEl.style.padding = '2px 6px';
@@ -327,6 +374,7 @@ es.onmessage = e => {
     
     $('lastValveOnAgo').textContent = d.lastValveOnAgo || '--:--:--';
     $('lastPumpOnAgo').textContent  = d.lastPumpOnAgo  || '--:--:--';
+    $('nextDrain').textContent = d.nextDrain || '--:--:--';
   }catch(_){}
 };
 </script>
@@ -596,7 +644,7 @@ void runLogic(unsigned long dtMs) {
       uint32_t currentTimestamp = (uint32_t)time(nullptr);
       uint32_t elapsedSec = currentTimestamp - lastEV1OnTimestamp;
       
-      if (elapsedSec >= ECO_DRAIN_INTERVAL_SEC) {
+      if (elapsedSec >= ecoDrainIntervalSec) {
         // Vidange active
         pumpOn = true;
         VoutOn = true;
@@ -613,24 +661,41 @@ void runLogic(unsigned long dtMs) {
     break;
   }
 
+    // Vidange manuelle : force pompe + Vout
+  if (manualDrainActive) {
+    pumpOn = true;
+    VoutOn = true;
+    // Arrêt si niveau ≤ 10%
+    if (levelNow <= 10) {
+      manualDrainActive = false;
+      if (SIMULATION) levelPct = 10;
+    }
+  }
+
   // 4) Appliquer les changements
   if (valveOn != prevValve) {
     if (valveOn) {
       pulseEV1(true);
       lastValveOnMs = now;
-      // Sauvegarder timestamp pour mode Eco
       lastEV1OnTimestamp = (uint32_t)time(nullptr);
       saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
     } else {
       pulseEV1(false);
     }
+  } else if (valveOn && lastValveOnMs == 0) {
+    lastValveOnMs = now;
   }
+
   
   // Pompe : appliquer si changement
   if (pumpOn != prevPump) {
     setPump(pumpOn);
     if (pumpOn) lastPumpOnMs = now;
+  } else if (pumpOn && lastPumpOnMs == 0) {
+    // Pompe déjà ON mais jamais timestampée (démarrage/changement mode)
+    lastPumpOnMs = now;
   }
+
   // Vout : appliquer si changement
   if (VoutOn != prevVout) {
     setEV_out(VoutOn);
@@ -736,6 +801,18 @@ String statusJson() {
   String sincePir = agoFrom(lastPirDetectMs);
   String lastValveOnAgo = agoFrom(lastValveOnMs);
   String lastPumpOnAgo  = agoFrom(lastPumpOnMs);
+String nextDrain = "--:--:--";
+  if (currentMode == MODE_ECO_HYBRID && lastEV1OnTimestamp > 0) {
+    uint32_t currentTime = (uint32_t)time(nullptr);
+    uint32_t elapsed = currentTime - lastEV1OnTimestamp;
+    
+    if (elapsed < ecoDrainIntervalSec) {
+      uint32_t remaining = ecoDrainIntervalSec - elapsed;
+      nextDrain = fmtHMS(remaining);
+    } else {
+      nextDrain = "00:00:00"; // Vidange due
+    }
+  }
 
   snprintf(buf, sizeof(buf),
     "{"
@@ -751,9 +828,13 @@ String statusJson() {
       "\"lastPumpOnAgo\":\"%s\","
       "\"uptime\":\"%s\","
       "\"mode\":%d,"
-      "\"ecoInClosedPhase\":%d"
+      "\"ecoInClosedPhase\":%d,"
+      "\"ecoDrainValue\":%u,"
+      "\"ecoDrainUnit\":\"%s\","
+      "\"nextDrain\":\"%s\","     // Virgule supprimée ici
+      "\"manualDrain\":%s" 
     "}",
-    (int)round(levelPct), distanceCm, temperatureC, humidityPct, pirState?1:0, valveOn?1:0, pumpOn?1:0, sincePir.c_str(), lastValveOnAgo.c_str(), lastPumpOnAgo.c_str(), uptimeStr().c_str(), currentMode, ecoInClosedPhase?1:0
+    (int)round(levelPct), distanceCm, temperatureC, humidityPct, pirState?1:0, valveOn?1:0, pumpOn?1:0, sincePir.c_str(), lastValveOnAgo.c_str(), lastPumpOnAgo.c_str(), uptimeStr().c_str(), currentMode, ecoInClosedPhase?1:0, ecoDrainValue, ecoDrainUnit.c_str(), nextDrain.c_str(),(manualDrainActive ? "true" : "false")
   );
   return String(buf);
 }
@@ -934,7 +1015,49 @@ void setup() {
         lastEV1OnTimestamp = (uint32_t)time(nullptr);
         saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
       }
+  
+    server.on("/setinterval", HTTP_GET, [](AsyncWebServerRequest *req){
+    if (req->hasParam("value") && req->hasParam("unit")) {
+      int value = req->getParam("value")->value().toInt();
+      String unit = req->getParam("unit")->value();
+      
+      if (unit == "hours") {
+        if (value >= 1 && value <= 720) {
+          ecoDrainIntervalSec = (uint32_t)value * 3600UL;
+          ecoDrainValue = value;
+          ecoDrainUnit = "hours";
+          req->send(200, "text/plain", "OK");
+        } else {
+          req->send(400, "text/plain", "heures entre 1-720");
+        }
+      } else if (unit == "days") {
+        if (value >= 1 && value <= 30) {
+          ecoDrainIntervalSec = (uint32_t)value * 24UL * 3600UL;
+          ecoDrainValue = value;
+          ecoDrainUnit = "days";
+          req->send(200, "text/plain", "OK");
+        } else {
+          req->send(400, "text/plain", "jours entre 1-30");
+        }
+      } else {
+        req->send(400, "text/plain", "unit invalide");
+      }
+    } else {
+      req->send(400, "text/plain", "Params manquants");
+    }
+  });
 
+  // Démarrer vidange manuelle
+  server.on("/drain", HTTP_GET, [](AsyncWebServerRequest *req){
+    manualDrainActive = true;
+    req->send(200, "text/plain", "Vidange démarrée");
+  });
+
+  // Arrêter vidange manuelle
+  server.on("/stopdrain", HTTP_GET, [](AsyncWebServerRequest *req){
+    manualDrainActive = false;
+    req->send(200, "text/plain", "Vidange arrêtée");
+  });
       
       // NOUVEAU : Forcer un état propre lors du changement de mode
       valveOn = false;
