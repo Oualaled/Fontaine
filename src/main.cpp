@@ -25,6 +25,8 @@
 #define EEPROM_MAGIC_ADDR 1
 #define EEPROM_MAGIC_VALUE 0xA5
 #define EEPROM_TIMESTAMP_ADDR 2
+#define EEPROM_DRAIN_VALUE    6   // 2 octets pour la valeur (1-720)
+#define EEPROM_DRAIN_UNIT     8   // 1 octet (0=days, 1=hours)
 
 // ===================== Configuration générale =====================
 #define SIMULATION false          // true = simulateur; false = capteurs réels
@@ -196,7 +198,7 @@ static const char index_html[] PROGMEM = R"HTML(
           <option value="hours">heures</option>
           <option value="days" selected>jours</option>
         </select>
-        <button class="btn btn-secondary" onclick="setInterval()">OK</button>
+        <button class="btn btn-secondary" onclick="setDrainInterval()">OK</button>
       </div>
     </div>
 
@@ -252,7 +254,7 @@ function setMode(m) {
     });
 }
 
-function setInterval() {
+function setDrainInterval() {
   const value = document.getElementById('ecoValue').value;
   const unit = document.getElementById('ecoUnit').value;
   fetch('/setinterval?value=' + value + '&unit=' + unit)
@@ -451,6 +453,56 @@ uint32_t loadEV1TimestampFromEEPROM() {
   return timestamp;
 }
 
+void saveDrainIntervalToEEPROM() {
+    // Sauvegarder la valeur (2 octets car max 720)
+    EEPROM.write(EEPROM_DRAIN_VALUE, (ecoDrainValue >> 8) & 0xFF);
+    EEPROM.write(EEPROM_DRAIN_VALUE + 1, ecoDrainValue & 0xFF);
+    
+    // Sauvegarder l'unité (0=days, 1=hours)
+    uint8_t unitCode = (ecoDrainUnit == "hours") ? 1 : 0;
+    EEPROM.write(EEPROM_DRAIN_UNIT, unitCode);
+    
+    EEPROM.commit();
+}
+
+void loadDrainIntervalFromEEPROM() {
+    // Vérifier si EEPROM initialisée
+    if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
+        // Valeurs par défaut
+        ecoDrainValue = 5;
+        ecoDrainUnit = "days";
+        ecoDrainIntervalSec = 5UL * 24UL * 3600UL;
+        return;
+    }
+    
+    // Lire la valeur
+    uint16_t value = 0;
+    value |= ((uint16_t)EEPROM.read(EEPROM_DRAIN_VALUE)) << 8;
+    value |= ((uint16_t)EEPROM.read(EEPROM_DRAIN_VALUE + 1));
+    
+    // Lire l'unité
+    uint8_t unitCode = EEPROM.read(EEPROM_DRAIN_UNIT);
+    
+    // Valider et appliquer
+    if (unitCode == 1 && value >= 1 && value <= 720) {
+        // Heures
+        ecoDrainUnit = "hours";
+        ecoDrainValue = value;
+        ecoDrainIntervalSec = (uint32_t)value * 3600UL;
+    } else if (unitCode == 0 && value >= 1 && value <= 30) {
+        // Jours
+        ecoDrainUnit = "days";
+        ecoDrainValue = value;
+        ecoDrainIntervalSec = (uint32_t)value * 24UL * 3600UL;
+    } else {
+        // Valeur corrompue, défaut
+        ecoDrainValue = 5;
+        ecoDrainUnit = "days";
+        ecoDrainIntervalSec = 5UL * 24UL * 3600UL;
+    }
+}
+
+
 int rssiToQuality(int rssiDbm) {
   // approx: -50 dBm => ~100%, -100 dBm => ~0%
   int q = map(constrain(rssiDbm, -100, -50), -100, -50, 0, 100);
@@ -473,7 +525,7 @@ bool readPir() {
   // --- PIR simulé en bursts ---
   static unsigned long nextBurstMs = 0;
   unsigned long now = millis();
-  if (SIM_FAKE_PIR_BURSTS && now > nextBurstMs) {
+  if (SIM_FAKE_PIR_BURSTS && (long)(now - nextBurstMs) >= 0) {
     pirSimUntilMs = now + (unsigned long)random(2000, 20000);   // 2–20 s
     nextBurstMs   = now + (unsigned long)random(20000, 25000);  // 20–25 s
   }
@@ -592,6 +644,26 @@ void runLogic(unsigned long dtMs) {
   int levelNow = cmToPercent(distanceCm);
   if (!SIMULATION) levelPct = levelNow;
 
+  // === AJOUTER ICI : Gestion vidange manuelle ===
+  if (manualDrainActive) {
+    valveOn = false;
+    pumpOn = true;
+    VoutOn = true;
+    
+    // Arrêt automatique si niveau très bas
+    if (levelNow <= 5) {
+      manualDrainActive = false;
+      pumpOn = false;
+      VoutOn = false;
+    }
+    
+    // Appliquer les relais et sortir (priorité sur les modes)
+    pulseEV1(valveOn);
+    setPump(pumpOn);
+    setEV_out(VoutOn);
+    return;  // Ne pas exécuter la logique des modes
+  }
+
   // 3) Décisions relais SELON LE MODE
   bool prevValve = valveOn;
   bool prevPump  = pumpOn;
@@ -629,6 +701,8 @@ void runLogic(unsigned long dtMs) {
         valveOn = false;
         // Basculer en cycle fermé dès que 90% atteint
         ecoInClosedPhase = true;
+        lastEV1OnTimestamp = (uint32_t)time(nullptr);
+        saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
       }
       
       pumpOn = false;
@@ -642,6 +716,11 @@ void runLogic(unsigned long dtMs) {
       
       // Vérifier si 5 jours écoulés depuis dernier remplissage
       uint32_t currentTimestamp = (uint32_t)time(nullptr);
+      // Protection : NTP pas encore synchronisé (timestamp avant 2024)
+      if (currentTimestamp < 1704067200) {  // 1er janvier 2024 00:00:00 UTC
+          // Heure invalide, on reste en cycle fermé sans déclencher vidange
+          break;
+      }
       uint32_t elapsedSec = currentTimestamp - lastEV1OnTimestamp;
       
       if (elapsedSec >= ecoDrainIntervalSec) {
@@ -653,9 +732,12 @@ void runLogic(unsigned long dtMs) {
         if (levelNow <= 10) {
           pumpOn = false;
           VoutOn = false;
-          ecoInClosedPhase = false;  // Retour phase remplissage
+          ecoInClosedPhase = false;
+          lastEV1OnTimestamp = (uint32_t)time(nullptr);
+          saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
           if (SIMULATION) levelPct = 10;
         }
+
       }
     }
     break;
@@ -677,8 +759,6 @@ void runLogic(unsigned long dtMs) {
     if (valveOn) {
       pulseEV1(true);
       lastValveOnMs = now;
-      lastEV1OnTimestamp = (uint32_t)time(nullptr);
-      saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
     } else {
       pulseEV1(false);
     }
@@ -888,6 +968,7 @@ void setup() {
   EEPROM.begin(EEPROM_SIZE);
   currentMode = loadModeFromEEPROM();
   lastEV1OnTimestamp = loadEV1TimestampFromEEPROM();
+  loadDrainIntervalFromEEPROM();
 
   // ========== Détection GPIO0 (bouton BOOT) ==========
   pinMode(0, INPUT_PULLUP);
@@ -1012,11 +1093,29 @@ void setup() {
       }
       if (currentMode == MODE_ECO_HYBRID) {
         // Réinitialiser le cycle Eco (nouveau départ)
+        ecoInClosedPhase = true;
         lastEV1OnTimestamp = (uint32_t)time(nullptr);
         saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
       }
-  
-    server.on("/setinterval", HTTP_GET, [](AsyncWebServerRequest *req){
+      
+      // NOUVEAU : Forcer un état propre lors du changement de mode
+      valveOn = false;
+      pumpOn = false;
+      VoutOn = false;
+      pulseEV1(false);
+      setPump(false);
+      setEV_out(false);
+      
+      request->send(200, "text/plain", "Mode changé");
+    } else {
+      request->send(400, "text/plain", "Mode invalide");
+    }
+  } else {
+    request->send(400, "text/plain", "Paramètre manquant");
+  }
+});
+
+server.on("/setinterval", HTTP_GET, [](AsyncWebServerRequest *req){
     if (req->hasParam("value") && req->hasParam("unit")) {
       int value = req->getParam("value")->value().toInt();
       String unit = req->getParam("unit")->value();
@@ -1026,6 +1125,7 @@ void setup() {
           ecoDrainIntervalSec = (uint32_t)value * 3600UL;
           ecoDrainValue = value;
           ecoDrainUnit = "hours";
+          saveDrainIntervalToEEPROM();
           req->send(200, "text/plain", "OK");
         } else {
           req->send(400, "text/plain", "heures entre 1-720");
@@ -1035,6 +1135,7 @@ void setup() {
           ecoDrainIntervalSec = (uint32_t)value * 24UL * 3600UL;
           ecoDrainValue = value;
           ecoDrainUnit = "days";
+          saveDrainIntervalToEEPROM();
           req->send(200, "text/plain", "OK");
         } else {
           req->send(400, "text/plain", "jours entre 1-30");
@@ -1058,23 +1159,6 @@ void setup() {
     manualDrainActive = false;
     req->send(200, "text/plain", "Vidange arrêtée");
   });
-      
-      // NOUVEAU : Forcer un état propre lors du changement de mode
-      valveOn = false;
-      pumpOn = false;
-      VoutOn = false;
-      pulseEV1(false);
-      setPump(false);
-      setEV_out(false);
-      
-      request->send(200, "text/plain", "Mode changé");
-    } else {
-      request->send(400, "text/plain", "Mode invalide");
-    }
-  } else {
-    request->send(400, "text/plain", "Paramètre manquant");
-  }
-});
 
   server.begin();
 
