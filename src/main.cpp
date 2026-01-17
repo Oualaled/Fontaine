@@ -1245,14 +1245,23 @@ void setup() {
   loadAllSettingsFromEEPROM();
 
   // ========== Détection GPIO0 (bouton BOOT) ==========
+  // ========== Détection GPIO0 (bouton BOOT) ==========
   pinMode(0, INPUT_PULLUP);
   delay(100);
-  
+
   if (digitalRead(0) == LOW) {  // Bouton BOOT enfoncé
-    Serial.println(F("MODE PROGRAMMATION (BOOT pressé)"));
-    while(true) { delay(1000); }  // Blocage
+    Serial.println(F("BOOT pressé - Reset EEPROM"));
+    
+    // Effacer EEPROM
+    for (int i = 0; i < EEPROM_SIZE; i++) {
+      EEPROM.write(i, 0xFF);
+    }
+    EEPROM.commit();
+    
+    Serial.println(F("EEPROM effacée - Redemarrage..."));
+    delay(1000);
+    ESP.restart();
   }
-  Serial.println(F("MODE NORMAL : Fontaine active"));
   // ===================================================
 
   // Baisser la fréquence CPU (80 MHz suffit pour ce projet)
