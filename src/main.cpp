@@ -19,34 +19,69 @@
 #include <time.h>
 #include "icons.h"
 
-// ===================== EEPROM =====================
-#define EEPROM_SIZE 64
-#define EEPROM_MODE_ADDR 0
-#define EEPROM_MAGIC_ADDR 1
-#define EEPROM_MAGIC_VALUE 0xA5
-#define EEPROM_TIMESTAMP_ADDR 2
-#define EEPROM_DRAIN_VALUE    6   // 2 octets pour la valeur (1-720)
-#define EEPROM_DRAIN_UNIT     8   // 1 octet (0=days, 1=hours)
-
 // ===================== Configuration générale =====================
 #define SIMULATION false          // true = simulateur; false = capteurs réels
 
-// ---- Modes de fonctionnement ----
-enum FountainMode {
-  MODE_OPEN_CYCLE = 0,   // Actuel : remplissage PIR + pompe auto
-  MODE_CLOSED_CYCLE = 1, // Eau réservoir en continu
-  MODE_ECO_HYBRID = 2    // Remplissage puis 5j fermé avant vidange
-};
+// === États de la fontaine ===
+bool fountainRunning = false;  // Marche/Arrêt global (défaut: OFF)
 
-FountainMode currentMode = MODE_CLOSED_CYCLE;
+// === Option: Source d'eau ===
+enum WaterSource { SRC_EXTERNAL, SRC_INTERNAL, SRC_AUTO };
+WaterSource waterSource = SRC_AUTO;  // Défaut: auto
 
-// Pour le mode Eco/Hybride
-uint32_t lastEV1OnTimestamp = 0;  // timestamp epoch (secondes depuis 1970)
-bool ecoInClosedPhase = false;
-uint32_t ecoDrainIntervalSec = 5UL * 24UL * 3600UL; // Modifiable via web
-String ecoDrainUnit = "days"; // "hours" ou "days"
-uint32_t ecoDrainValue = 5;   // Valeur affichée (5 jours ou X heures)
-bool manualDrainActive = false; // Vidange manuelle
+// === Option: Écoulement ===
+enum FlowMode { FLOW_PIR, FLOW_CONTINUOUS };
+FlowMode flowMode = FLOW_CONTINUOUS;  // Défaut: continu
+
+// === Option: Vidange ===
+enum DrainMode { DRAIN_NEVER, DRAIN_PERIODIC, DRAIN_AT_LEVEL };
+DrainMode drainMode = DRAIN_NEVER;  // Défaut: jamais
+
+// Paramètres vidange périodique
+enum DrainScheduleType { DRAIN_DAILY, DRAIN_SPECIFIC_DAYS, DRAIN_EVERY_X_HOURS };
+DrainScheduleType drainScheduleType = DRAIN_DAILY;
+uint8_t drainHour = 3;      // Heure de vidange (0-23)
+uint8_t drainMinute = 0;    // Minute de vidange (0-59)
+uint8_t drainDays = 0b1111111;  // Bitmask jours (bit0=Lun...bit6=Dim)
+uint16_t drainEveryHours = 24;  // Toutes les X heures (1-720)
+uint32_t lastDrainTimestamp = 0;  // Epoch dernière vidange
+
+// Paramètres vidange au niveau
+uint8_t drainAtLevelPct = 95;  // Vidanger quand niveau atteint X%
+
+// === Calibration des seuils ===
+float calibZeroCm = 0.0;    // Distance capteur quand cuve vide (0%)
+float calibFullCm = 0.0;    // Distance capteur quand cuve pleine (100%)
+bool calibrationDone = false;
+
+// Seuils de fonctionnement (en %)
+uint8_t thresholdMin = 25;   // Seuil bas (arrêt pompe si interne)
+uint8_t thresholdMax = 90;   // Seuil haut (arrêt remplissage si externe)
+
+// === État vidange en cours ===
+bool drainInProgress = false;
+bool manualDrainActive = false;
+
+// ===================== EEPROM =====================
+#define EEPROM_SIZE 64
+#define EEPROM_MAGIC_ADDR       0
+#define EEPROM_MAGIC_VALUE      0xA7
+#define EEPROM_RUNNING          1   // 1 byte
+#define EEPROM_WATER_SOURCE     2   // 1 byte
+#define EEPROM_FLOW_MODE        3   // 1 byte
+#define EEPROM_DRAIN_MODE       4   // 1 byte
+#define EEPROM_DRAIN_SCHEDULE   5   // 1 byte
+#define EEPROM_DRAIN_HOUR       6   // 1 byte
+#define EEPROM_DRAIN_MINUTE     7   // 1 byte
+#define EEPROM_DRAIN_DAYS       8   // 1 byte
+#define EEPROM_DRAIN_EVERY_H    9   // 2 bytes (9-10)
+#define EEPROM_DRAIN_LEVEL      11  // 1 byte
+#define EEPROM_THRESHOLD_MIN    12  // 1 byte
+#define EEPROM_THRESHOLD_MAX    13  // 1 byte
+#define EEPROM_CALIB_ZERO       14  // 4 bytes (14-17)
+#define EEPROM_CALIB_FULL       18  // 4 bytes (18-21)
+#define EEPROM_CALIB_DONE       22  // 1 byte
+#define EEPROM_LAST_DRAIN       23  // 4 bytes (23-26)
 
 
 // ---- WiFi ----
@@ -150,237 +185,337 @@ AsyncEventSource events("/events");
 
 // Page web minimaliste (SSE) — tout-en-un
 static const char index_html[] PROGMEM = R"HTML(
-<!doctype html><html lang="fr"><meta charset="utf-8">
+<!doctype html><html lang="fr"><head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fontaine</title>
 <style>
-  :root{font:14px system-ui,Segoe UI,Roboto,Ubuntu,Arial}
-  body{margin:0;background:#0b1220;color:#e8eefc}
-  header{padding:12px 16px;background:#0f172a;position:sticky;top:0}
-  main{padding:16px;max-width:900px;margin:auto}
-  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
-  .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
-  .title{opacity:.8;font-size:12px;margin-bottom:6px}
-  .big{font-size:36px;margin:4px 0 10px}
-  .row{display:flex;gap:8px;align-items:center}
-  .pill{padding:3px 8px;border-radius:999px;background:#1f2937;font-size:12px}
-  progress{width:100%;height:10px}
-  code{background:#0a0f1a;padding:2px 6px;border-radius:6px}
-  .btn{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
-  .btn-primary{background:#3b82f6;color:#fff}
-  .btn-primary:hover{background:#2563eb}
-  .btn-secondary{background:#6b7280;color:#fff}
-  .btn-secondary:hover{background:#4b5563}
-  .btn.active{background:#10b981;color:#000}
-  .btn-danger{background:#dc2626;color:#fff}
-  .btn-danger:hover{background:#b91c1c}
-  .mode-selector{display:flex;gap:8px;margin-top:8px}
-  input[type=number]{background:#1f2937;color:#fff;border:1px solid #374151;padding:6px;border-radius:6px;width:60px}
+:root{font:14px system-ui,Segoe UI,Roboto,Ubuntu,Arial}
+body{margin:0;background:#0b1220;color:#e8eefc}
+header{padding:12px 16px;background:#0f172a;position:sticky;top:0;display:flex;justify-content:space-between;align-items:center}
+main{padding:16px;max-width:900px;margin:auto}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
+.card h3{margin:0 0 12px;font-size:14px;opacity:.9}
+.title{opacity:.8;font-size:12px;margin-bottom:6px}
+.big{font-size:36px;margin:4px 0 10px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.pill{padding:3px 8px;border-radius:999px;background:#1f2937;font-size:12px}
+code{background:#0a0f1a;padding:2px 6px;border-radius:6px}
+.btn{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.btn-sm{padding:4px 10px;font-size:12px}
+.btn-primary{background:#3b82f6;color:#fff}
+.btn-primary:hover{background:#2563eb}
+.btn-success{background:#10b981;color:#fff}
+.btn-success:hover{background:#059669}
+.btn-danger{background:#dc2626;color:#fff}
+.btn-danger:hover{background:#b91c1c}
+.btn-secondary{background:#4b5563;color:#fff}
+.btn-secondary:hover{background:#374151}
+.btn.active{background:#10b981!important;color:#000}
+.btn-group{display:flex;gap:4px}
+.btn-group .btn{border-radius:0}
+.btn-group .btn:first-child{border-radius:6px 0 0 6px}
+.btn-group .btn:last-child{border-radius:0 6px 6px 0}
+select,input[type=number],input[type=time]{background:#1f2937;color:#fff;border:1px solid #374151;padding:6px 10px;border-radius:6px;font-size:13px}
+input[type=number]{width:60px}
+.toggle{position:relative;width:50px;height:26px;display:inline-block}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#4b5563;border-radius:26px;transition:.3s}
+.toggle input:checked+.slider{background:#10b981}
+.toggle .slider:before{content:"";position:absolute;height:20px;width:20px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.toggle input:checked+.slider:before{transform:translateX(24px)}
+.power-btn{width:60px;height:60px;border-radius:50%;font-size:24px;display:flex;align-items:center;justify-content:center}
+.power-btn.off{background:#dc2626}
+.power-btn.on{background:#10b981}
+.sub-options{margin-left:20px;padding:10px;background:#0a0f1a;border-radius:8px;margin-top:8px}
+.hidden{display:none!important}
+.status-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center}
+.status-item{background:#1f2937;padding:8px;border-radius:8px}
+.status-item .val{font-size:18px;font-weight:bold}
+.status-item .lbl{font-size:11px;opacity:.7}
+.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+label{display:flex;align-items:center;gap:8px;cursor:pointer}
+.checkbox-days{display:flex;gap:4px;flex-wrap:wrap}
+.checkbox-days label{background:#1f2937;padding:4px 8px;border-radius:4px;font-size:12px}
+.checkbox-days input:checked+span{color:#10b981;font-weight:bold}
 </style>
+</head>
+<body>
 <header>
-  <div class="row"><strong>Fontaine</strong> (<span id="lastUpdate">--</span>)</div>
+  <strong>Fontaine</strong>
+  <div class="row">
+    <span id="clock">--:--</span>
+    <button id="powerBtn" class="btn power-btn off" onclick="togglePower()">⏻</button>
+  </div>
 </header>
-<main class="grid">
-  <div class="card">
-    <div class="title">Mode de fonctionnement</div>
-    <div id="currentMode" class="big" style="display:none" >Cycle Ouvert</div>
-    <div class="mode-selector">
-      <button class="btn btn-primary" onclick="setMode(0)">Cycle Ouvert</button>
-      <button class="btn btn-secondary" onclick="setMode(1)">Cycle Fermé</button>
-      <button class="btn btn-secondary" onclick="setMode(2)">Eco/Hybride</button>
+
+<main>
+  <!-- Status -->
+  <div class="card" style="margin-bottom:12px">
+    <div class="status-grid">
+      <div class="status-item"><div class="val" id="level">--</div><div class="lbl">Niveau %</div></div>
+      <div class="status-item"><div class="val" id="temp">--</div><div class="lbl">Temp °C</div></div>
+      <div class="status-item"><div class="val" id="hum">--</div><div class="lbl">Humidité %</div></div>
+      <div class="status-item"><div class="val" id="ev1">--</div><div class="lbl">EV1</div></div>
+      <div class="status-item"><div class="val" id="pump">--</div><div class="lbl">Pompe</div></div>
+      <div class="status-item"><div class="val" id="vout">--</div><div class="lbl">Évac.</div></div>
     </div>
-    <div id="ecoInfo" style="margin-top:8px;font-size:11px;opacity:0.7"></div>
-    <div id="ecoConfig" style="display:none;margin-top:12px">
-      <div class="row">
-        <span>Vidange tous les</span>
-        <input type="number" id="ecoValue" min="1" max="720" value="5">
-        <select id="ecoUnit" style="background:#1f2937;color:#fff;border:1px solid #374151;padding:6px;border-radius:6px">
-          <option value="hours">heures</option>
-          <option value="days" selected>jours</option>
-        </select>
-        <button class="btn btn-secondary" onclick="setDrainInterval()">OK</button>
+  </div>
+
+  <div class="grid">
+    <!-- Source d'eau -->
+    <div class="card">
+      <h3>💧 Source d'eau</h3>
+      <div class="btn-group">
+        <button class="btn" data-src="0" onclick="setSource(0)">Externe</button>
+        <button class="btn" data-src="1" onclick="setSource(1)">Interne</button>
+        <button class="btn" data-src="2" onclick="setSource(2)">Auto</button>
+      </div>
+      <div class="sub-options" id="srcAutoOpts">
+        <div class="row">
+          <span>Seuils :</span>
+          <input type="number" id="threshMin" min="5" max="50" value="25"> % min
+          <input type="number" id="threshMax" min="50" max="100" value="90"> % max
+          <button class="btn btn-sm btn-secondary" onclick="setThresholds()">OK</button>
+        </div>
       </div>
     </div>
 
-  </div>
-
-  <div class="card">
-    <div class="title">Niveau de remplissage du réservoir</div>
-    <div class="big"><span id="level">–</span>%</div>
-    <progress id="lvlbar" max="100" value="0"></progress>
-    <div class="row"><span>Distance mesurée:</span><code id="dist">–</code><span>cm</span></div>
-  </div>
-  
-  <div class="card">
-    <div class="title">État</div>
-    <div class="row">PIR: <strong id="pir">–</strong></div>
-    <div class="row">Électrovanne: <strong id="valve">–</strong></div>
-    <div class="row">Pompe: <strong id="pump">–</strong></div>
-  </div>
-  
-  <div class="card">
-    <div class="title">Climat</div>
-    <div class="row"><span>Température:</span><code id="temp">–</code><span>°C</span></div>
-    <div class="row"><span>Humidité:</span><code id="hum">–</code><span>%</span></div>
-  </div>
-
-  <div class="card">
-    <div class="title">Historique</div>
-    <div class="row">Depuis dernière détection PIR: <strong id="sincePir">–:–:–</strong></div>
-    <div class="row">Dernier allumage électrovanne: <strong id="lastValveOnAgo">–:–:–</strong></div>
-    <div class="row">Dernier allumage pompe: <strong id="lastPumpOnAgo">–:–:–</strong></div>
-    <div class="row">Prochaine vidange: <strong id="nextDrain">–:–:–</strong></div> 
-  </div>
-  
-  <div class="card">
-    <div class="title">Vidange manuelle</div>
-    <div class="row" style="gap:12px">
-      <button class="btn btn-danger" onclick="startDrain()">Démarrer vidange</button>
-      <button class="btn btn-secondary" onclick="stopDrain()">Arrêter</button>
+    <!-- Écoulement -->
+    <div class="card">
+      <h3>🌊 Écoulement</h3>
+      <div class="btn-group">
+        <button class="btn" data-flow="0" onclick="setFlow(0)">PIR</button>
+        <button class="btn" data-flow="1" onclick="setFlow(1)">Continu</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span class="pill">PIR: <span id="pirStatus">--</span></span>
+        <span class="pill">Depuis: <span id="sincePir">--</span></span>
+      </div>
     </div>
-    <div id="drainStatus" style="margin-top:8px;font-size:12px"></div>
+
+    <!-- Vidange -->
+    <div class="card">
+      <h3>🚿 Vidange</h3>
+      <div class="btn-group">
+        <button class="btn" data-drain="0" onclick="setDrain(0)">Jamais</button>
+        <button class="btn" data-drain="1" onclick="setDrain(1)">Périodique</button>
+        <button class="btn" data-drain="2" onclick="setDrain(2)">Au niveau</button>
+      </div>
+      
+      <!-- Options périodique -->
+      <div class="sub-options hidden" id="drainPeriodicOpts">
+        <div class="row">
+          <select id="drainSchedule" onchange="updateDrainUI()">
+            <option value="0">Tous les jours à</option>
+            <option value="1">Certains jours à</option>
+            <option value="2">Toutes les X heures</option>
+          </select>
+        </div>
+        <div class="row" id="drainTimeRow">
+          <input type="time" id="drainTime" value="03:00">
+        </div>
+        <div class="row hidden" id="drainDaysRow">
+          <div class="checkbox-days">
+            <label><input type="checkbox" name="day" value="0" checked><span>Lun</span></label>
+            <label><input type="checkbox" name="day" value="1" checked><span>Mar</span></label>
+            <label><input type="checkbox" name="day" value="2" checked><span>Mer</span></label>
+            <label><input type="checkbox" name="day" value="3" checked><span>Jeu</span></label>
+            <label><input type="checkbox" name="day" value="4" checked><span>Ven</span></label>
+            <label><input type="checkbox" name="day" value="5" checked><span>Sam</span></label>
+            <label><input type="checkbox" name="day" value="6" checked><span>Dim</span></label>
+          </div>
+        </div>
+        <div class="row hidden" id="drainHoursRow">
+          <span>Toutes les</span>
+          <input type="number" id="drainHours" min="1" max="720" value="24">
+          <span>heures</span>
+        </div>
+        <button class="btn btn-sm btn-primary" onclick="saveDrainSettings()">Enregistrer</button>
+      </div>
+      
+      <!-- Options au niveau -->
+      <div class="sub-options hidden" id="drainLevelOpts">
+        <div class="row">
+          <span>Vidanger à</span>
+          <input type="number" id="drainLevel" min="50" max="100" value="95">
+          <span>%</span>
+          <button class="btn btn-sm btn-primary" onclick="saveDrainLevel()">OK</button>
+        </div>
+      </div>
+      
+      <div class="row" style="margin-top:12px">
+        <button class="btn btn-danger" id="drainNowBtn" onclick="drainNow()">Vidanger maintenant</button>
+        <span class="pill" id="drainStatus"></span>
+      </div>
+    </div>
+
+    <!-- Calibration -->
+    <div class="card">
+      <h3>📏 Calibration</h3>
+      <div class="row">
+        <span>Distance actuelle: <strong id="currentDist">--</strong> cm</span>
+      </div>
+      <div class="row">
+        <button class="btn btn-secondary" onclick="calibrate(0)">Définir 0%</button>
+        <button class="btn btn-secondary" onclick="calibrate(100)">Définir 100%</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span class="pill">0% = <span id="calib0">--</span> cm</span>
+        <span class="pill">100% = <span id="calib100">--</span> cm</span>
+      </div>
+    </div>
+
+    <!-- Préréglages -->
+    <div class="card">
+      <h3>⚡ Préréglages rapides</h3>
+      <div class="presets">
+        <button class="btn btn-secondary" onclick="applyPreset(0)">Cycle fermé</button>
+        <button class="btn btn-secondary" onclick="applyPreset(1)">Cycle ouvert</button>
+        <button class="btn btn-secondary" onclick="applyPreset(2)">Hybride</button>
+        <button class="btn btn-secondary" onclick="applyPreset(3)">Éco</button>
+      </div>
+      <p style="font-size:11px;opacity:.6;margin-top:8px">
+        Les préréglages modifient les options ci-dessus selon des configurations typiques.
+      </p>
+    </div>
   </div>
 </main>
+
 <script>
-const modeNames = ['Cycle Ouvert', 'Cycle Fermé', 'Eco/Hybride'];
+const $=id=>document.getElementById(id);
 
-function setMode(m) {
-  fetch('/setmode?mode=' + m)
-    .then(r => r.text())
-    .then(() => {
-      document.querySelectorAll('.mode-selector .btn').forEach((btn, i) => {
-        btn.className = 'btn ' + (i === m ? 'btn-primary active' : 'btn-secondary');
-      });
-    });
-}
-
-function setDrainInterval() {
-  const value = document.getElementById('ecoValue').value;
-  const unit = document.getElementById('ecoUnit').value;
-  fetch('/setinterval?value=' + value + '&unit=' + unit)
-    .then(r => r.text())
-    .then(txt => alert(txt === 'OK' ? 'Intervalle modifié' : txt));
-}
-
-
-function startDrain() {
-  if (confirm('Démarrer la vidange ?')) {
-    fetch('/drain').then(() => alert('Vidange démarrée'));
-  }
-}
-
-function stopDrain() {
-  fetch('/stopdrain').then(() => alert('Vidange arrêtée'));
-}
-
+// SSE
 const es = new EventSource('/events');
 es.onmessage = e => {
-  try{
+  try {
     const d = JSON.parse(e.data);
-    const $ = id => document.getElementById(id);
+    $('level').textContent = d.level?.toFixed(0) ?? '--';
+    $('temp').textContent = d.temp?.toFixed(1) ?? '--';
+    $('hum').textContent = d.hum?.toFixed(0) ?? '--';
+    $('ev1').textContent = d.valve ? 'Ouvert' : 'Fermé';
+    $('pump').textContent = d.pump ? 'ON' : 'OFF';
+    $('vout').textContent = d.vout ? 'ON' : 'OFF';
+    $('pirStatus').textContent = d.pir ? '🟢' : '⚫';
+    $('sincePir').textContent = d.sincePir || '--';
+    $('currentDist').textContent = d.dist?.toFixed(1) ?? '--';
+    $('clock').textContent = d.time || '--:--';
     
-    const now = new Date();
-    const timeStr = now.toLocaleTimeString('fr-FR');
-    const dateStr = now.toLocaleDateString('fr-FR');
-    $('lastUpdate').textContent = `${dateStr} ${timeStr}`;
-
-    // Mode
-    const mode = d.mode ?? 0;
-    $('currentMode').textContent = modeNames[mode];
-    document.querySelectorAll('.mode-selector .btn').forEach((btn, i) => {
-      btn.className = 'btn ' + (i === mode ? 'btn-primary active' : 'btn-secondary');
-    });
-    
-    // Config Eco visible uniquement en mode 2
-    const ecoConfig = $('ecoConfig');
-    if (mode === 2) {
-      ecoConfig.style.display = 'block';
-      $('ecoValue').value = d.ecoDrainValue || 5;
-      $('ecoUnit').value = d.ecoDrainUnit || 'days';
+    // Power button
+    const pb = $('powerBtn');
+    if (d.running) {
+      pb.classList.remove('off');
+      pb.classList.add('on');
     } else {
-      ecoConfig.style.display = 'none';
+      pb.classList.remove('on');
+      pb.classList.add('off');
     }
-
     
-    // Info Eco
-    if (mode === 2 && d.ecoInClosedPhase) {
-      $('ecoInfo').textContent = 'Phase fermée active (' + (d.ecoDrainDays || 5) + ' jours)';
+    // Update UI states
+    updateSourceUI(d.waterSource);
+    updateFlowUI(d.flowMode);
+    updateDrainModeUI(d.drainMode);
+    
+    $('threshMin').value = d.threshMin || 25;
+    $('threshMax').value = d.threshMax || 90;
+    $('calib0').textContent = d.calib0?.toFixed(1) ?? '--';
+    $('calib100').textContent = d.calib100?.toFixed(1) ?? '--';
+    $('drainLevel').value = d.drainAtLevel || 95;
+    
+    // Drain status
+    if (d.drainInProgress) {
+      $('drainStatus').textContent = '⏳ Vidange en cours...';
+      $('drainNowBtn').disabled = true;
     } else {
-      $('ecoInfo').textContent = '';
+      $('drainStatus').textContent = d.nextDrain ? 'Prochaine: ' + d.nextDrain : '';
+      $('drainNowBtn').disabled = false;
     }
-
-    // Statut vidange
-    if (d.manualDrain) {
-      $('drainStatus').textContent = '⚠️ Vidange en cours...';
-      $('drainStatus').style.color = '#f59e0b';
-    } else {
-      $('drainStatus').textContent = '';
-    }
-    
-    $('level').textContent = d.level;
-    $('lvlbar').value = d.level;
-    $('dist').textContent = d.distance.toFixed(1);
-    $('temp').textContent = d.temp?.toFixed(1);
-    
-    const temp = d.temp ?? 20;
-    const tempEl = $('temp');
-    if (temp > 30) {
-      tempEl.style.background = '#dc2626';
-      tempEl.style.color = '#fff';
-      tempEl.style.padding = '2px 6px';
-      tempEl.style.borderRadius = '4px';
-      tempEl.style.fontWeight = 'bold';
-    } else if (temp > 25) {
-      tempEl.style.background = '#f59e0b';
-      tempEl.style.color = '#000';
-      tempEl.style.padding = '2px 6px';
-      tempEl.style.borderRadius = '4px';
-      tempEl.style.fontWeight = 'bold';
-    } else if (temp < 15) {
-      tempEl.style.background = '#3b82f6';
-      tempEl.style.color = '#fff';
-      tempEl.style.padding = '2px 6px';
-      tempEl.style.borderRadius = '4px';
-      tempEl.style.fontWeight = 'bold';
-    } else {
-      tempEl.style.background = '';
-      tempEl.style.color = '';
-      tempEl.style.padding = '';
-      tempEl.style.fontWeight = '';
-    }
-    
-    $('hum').textContent = d.humidity?.toFixed(1);
-    $('pir').textContent = d.pir ? 'Détecté' : 'Aucun';
-    $('valve').textContent = d.valve ? 'Ouverte' : 'Fermée';
-    $('pump').textContent = d.pump ? 'Active' : 'Arrêtée';
-    
-    const sincePir = d.sincePir || '--:--:--';
-    $('sincePir').textContent = sincePir;
-    const sincePirEl = $('sincePir');
-    if (sincePir !== '--:--:--') {
-      const [h,m,s] = sincePir.split(':').map(Number);
-      const totalSec = h*3600 + m*60 + s;
-      if (totalSec > 3600) {
-        sincePirEl.style.background = '#dc2626';
-        sincePirEl.style.color = '#fff';
-        sincePirEl.style.padding = '2px 6px';
-        sincePirEl.style.borderRadius = '4px';
-        sincePirEl.style.fontWeight = 'bold';
-      } else {
-        sincePirEl.style.background = '';
-        sincePirEl.style.color = '';
-        sincePirEl.style.padding = '';
-        sincePirEl.style.fontWeight = '';
-      }
-    }
-    
-    $('lastValveOnAgo').textContent = d.lastValveOnAgo || '--:--:--';
-    $('lastPumpOnAgo').textContent  = d.lastPumpOnAgo  || '--:--:--';
-    $('nextDrain').textContent = d.nextDrain || '--:--:--';
-  }catch(_){}
+  } catch(_){}
 };
+
+function updateSourceUI(src) {
+  document.querySelectorAll('[data-src]').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.src) === src);
+  });
+  $('srcAutoOpts').classList.toggle('hidden', src !== 2);
+}
+
+function updateFlowUI(flow) {
+  document.querySelectorAll('[data-flow]').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.flow) === flow);
+  });
+}
+
+function updateDrainModeUI(mode) {
+  document.querySelectorAll('[data-drain]').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.drain) === mode);
+  });
+  $('drainPeriodicOpts').classList.toggle('hidden', mode !== 1);
+  $('drainLevelOpts').classList.toggle('hidden', mode !== 2);
+}
+
+function updateDrainUI() {
+  const sched = parseInt($('drainSchedule').value);
+  $('drainTimeRow').classList.toggle('hidden', sched === 2);
+  $('drainDaysRow').classList.toggle('hidden', sched !== 1);
+  $('drainHoursRow').classList.toggle('hidden', sched !== 2);
+}
+
+function togglePower() {
+  fetch('/power').then(r => r.text());
+}
+
+function setSource(s) {
+  fetch('/setsource?v=' + s).then(r => r.text());
+}
+
+function setFlow(f) {
+  fetch('/setflow?v=' + f).then(r => r.text());
+}
+
+function setDrain(d) {
+  fetch('/setdrain?v=' + d).then(r => r.text());
+}
+
+function setThresholds() {
+  const min = $('threshMin').value;
+  const max = $('threshMax').value;
+  fetch('/setthresh?min=' + min + '&max=' + max).then(r => r.text());
+}
+
+function saveDrainSettings() {
+  const sched = $('drainSchedule').value;
+  const time = $('drainTime').value;
+  let days = 0;
+  document.querySelectorAll('[name="day"]:checked').forEach(cb => {
+    days |= (1 << parseInt(cb.value));
+  });
+  const hours = $('drainHours').value;
+  fetch('/setdrainsched?type=' + sched + '&time=' + time + '&days=' + days + '&hours=' + hours)
+    .then(r => r.text());
+}
+
+function saveDrainLevel() {
+  const lvl = $('drainLevel').value;
+  fetch('/setdrainlevel?v=' + lvl).then(r => r.text());
+}
+
+function drainNow() {
+  fetch('/drain').then(r => r.text());
+}
+
+function calibrate(pct) {
+  fetch('/calibrate?pct=' + pct).then(r => r.text());
+}
+
+function applyPreset(p) {
+  fetch('/preset?v=' + p).then(r => r.text());
+}
+
+updateDrainUI();
 </script>
-</html>
+</body></html>
 )HTML";
 
 // ===================== Outils =====================
@@ -412,97 +547,106 @@ void pulseEV1(bool open) {
   digitalWrite(PIN_EV1_AIN2, LOW);
 }
 
-void saveModeToEEPROM(FountainMode mode) {
-  EEPROM.write(EEPROM_MODE_ADDR, (uint8_t)mode);
+// ===================== FONCTIONS EEPROM =====================
+
+void saveFloatToEEPROM(int addr, float value) {
+  uint8_t* p = (uint8_t*)&value;
+  for (int i = 0; i < 4; i++) {
+    EEPROM.write(addr + i, p[i]);
+  }
+}
+
+float loadFloatFromEEPROM(int addr) {
+  float value;
+  uint8_t* p = (uint8_t*)&value;
+  for (int i = 0; i < 4; i++) {
+    p[i] = EEPROM.read(addr + i);
+  }
+  return value;
+}
+
+void saveUint32ToEEPROM(int addr, uint32_t value) {
+  EEPROM.write(addr + 0, (value >> 24) & 0xFF);
+  EEPROM.write(addr + 1, (value >> 16) & 0xFF);
+  EEPROM.write(addr + 2, (value >> 8) & 0xFF);
+  EEPROM.write(addr + 3, value & 0xFF);
+}
+
+uint32_t loadUint32FromEEPROM(int addr) {
+  uint32_t value = 0;
+  value |= ((uint32_t)EEPROM.read(addr + 0)) << 24;
+  value |= ((uint32_t)EEPROM.read(addr + 1)) << 16;
+  value |= ((uint32_t)EEPROM.read(addr + 2)) << 8;
+  value |= ((uint32_t)EEPROM.read(addr + 3));
+  return value;
+}
+
+void saveAllSettingsToEEPROM() {
   EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
+  EEPROM.write(EEPROM_RUNNING, fountainRunning ? 1 : 0);
+  EEPROM.write(EEPROM_WATER_SOURCE, (uint8_t)waterSource);
+  EEPROM.write(EEPROM_FLOW_MODE, (uint8_t)flowMode);
+  EEPROM.write(EEPROM_DRAIN_MODE, (uint8_t)drainMode);
+  EEPROM.write(EEPROM_DRAIN_SCHEDULE, (uint8_t)drainScheduleType);
+  EEPROM.write(EEPROM_DRAIN_HOUR, drainHour);
+  EEPROM.write(EEPROM_DRAIN_MINUTE, drainMinute);
+  EEPROM.write(EEPROM_DRAIN_DAYS, drainDays);
+  EEPROM.write(EEPROM_DRAIN_EVERY_H, (drainEveryHours >> 8) & 0xFF);
+  EEPROM.write(EEPROM_DRAIN_EVERY_H + 1, drainEveryHours & 0xFF);
+  EEPROM.write(EEPROM_DRAIN_LEVEL, drainAtLevelPct);
+  EEPROM.write(EEPROM_THRESHOLD_MIN, thresholdMin);
+  EEPROM.write(EEPROM_THRESHOLD_MAX, thresholdMax);
+  saveFloatToEEPROM(EEPROM_CALIB_ZERO, calibZeroCm);
+  saveFloatToEEPROM(EEPROM_CALIB_FULL, calibFullCm);
+  EEPROM.write(EEPROM_CALIB_DONE, calibrationDone ? 1 : 0);
+  saveUint32ToEEPROM(EEPROM_LAST_DRAIN, lastDrainTimestamp);
   EEPROM.commit();
 }
 
-FountainMode loadModeFromEEPROM() {
+void loadAllSettingsFromEEPROM() {
   if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
-    // EEPROM jamais initialisée
-    saveModeToEEPROM(MODE_CLOSED_CYCLE);
-    return MODE_CLOSED_CYCLE;
+    // Première utilisation : valeurs par défaut
+    fountainRunning = false;
+    waterSource = SRC_AUTO;
+    flowMode = FLOW_CONTINUOUS;
+    drainMode = DRAIN_NEVER;
+    drainScheduleType = DRAIN_DAILY;
+    drainHour = 3;
+    drainMinute = 0;
+    drainDays = 0b1111111;
+    drainEveryHours = 24;
+    drainAtLevelPct = 95;
+    thresholdMin = 25;
+    thresholdMax = 90;
+    calibZeroCm = SENSOR_OFFSET_CM + TANK_HEIGHT_CM;  // Défaut
+    calibFullCm = SENSOR_OFFSET_CM;                    // Défaut
+    calibrationDone = false;
+    lastDrainTimestamp = 0;
+    saveAllSettingsToEEPROM();
+    return;
   }
-  uint8_t mode = EEPROM.read(EEPROM_MODE_ADDR);
-  if (mode > 2) {
-    // Valeur corrompue
-    saveModeToEEPROM(MODE_CLOSED_CYCLE);
-    return MODE_CLOSED_CYCLE;
-  }
-  return (FountainMode)mode;
+  
+  fountainRunning = false;  // Toujours OFF au démarrage
+  waterSource = (WaterSource)constrain(EEPROM.read(EEPROM_WATER_SOURCE), 0, 2);
+  flowMode = (FlowMode)constrain(EEPROM.read(EEPROM_FLOW_MODE), 0, 1);
+  drainMode = (DrainMode)constrain(EEPROM.read(EEPROM_DRAIN_MODE), 0, 2);
+  drainScheduleType = (DrainScheduleType)constrain(EEPROM.read(EEPROM_DRAIN_SCHEDULE), 0, 2);
+  drainHour = constrain(EEPROM.read(EEPROM_DRAIN_HOUR), 0, 23);
+  drainMinute = constrain(EEPROM.read(EEPROM_DRAIN_MINUTE), 0, 59);
+  drainDays = EEPROM.read(EEPROM_DRAIN_DAYS);
+  drainEveryHours = (EEPROM.read(EEPROM_DRAIN_EVERY_H) << 8) | EEPROM.read(EEPROM_DRAIN_EVERY_H + 1);
+  drainEveryHours = constrain(drainEveryHours, 1, 720);
+  drainAtLevelPct = constrain(EEPROM.read(EEPROM_DRAIN_LEVEL), 50, 100);
+  thresholdMin = constrain(EEPROM.read(EEPROM_THRESHOLD_MIN), 5, 50);
+  thresholdMax = constrain(EEPROM.read(EEPROM_THRESHOLD_MAX), 50, 100);
+  calibZeroCm = loadFloatFromEEPROM(EEPROM_CALIB_ZERO);
+  calibFullCm = loadFloatFromEEPROM(EEPROM_CALIB_FULL);
+  calibrationDone = EEPROM.read(EEPROM_CALIB_DONE) == 1;
+  lastDrainTimestamp = loadUint32FromEEPROM(EEPROM_LAST_DRAIN);
 }
+// ======================= FIN EEPROM =======================
 
-void saveEV1TimestampToEEPROM(uint32_t timestamp) {
-  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 0, (timestamp >> 24) & 0xFF);
-  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 1, (timestamp >> 16) & 0xFF);
-  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 2, (timestamp >> 8) & 0xFF);
-  EEPROM.write(EEPROM_TIMESTAMP_ADDR + 3, timestamp & 0xFF);
-  EEPROM.commit();
-}
-
-uint32_t loadEV1TimestampFromEEPROM() {
-  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
-    return 0;
-  }
-  uint32_t timestamp = 0;
-  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 0)) << 24;
-  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 1)) << 16;
-  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 2)) << 8;
-  timestamp |= ((uint32_t)EEPROM.read(EEPROM_TIMESTAMP_ADDR + 3));
-  return timestamp;
-}
-
-void saveDrainIntervalToEEPROM() {
-    // Sauvegarder la valeur (2 octets car max 720)
-    EEPROM.write(EEPROM_DRAIN_VALUE, (ecoDrainValue >> 8) & 0xFF);
-    EEPROM.write(EEPROM_DRAIN_VALUE + 1, ecoDrainValue & 0xFF);
-    
-    // Sauvegarder l'unité (0=days, 1=hours)
-    uint8_t unitCode = (ecoDrainUnit == "hours") ? 1 : 0;
-    EEPROM.write(EEPROM_DRAIN_UNIT, unitCode);
-    
-    EEPROM.commit();
-}
-
-void loadDrainIntervalFromEEPROM() {
-    // Vérifier si EEPROM initialisée
-    if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
-        // Valeurs par défaut
-        ecoDrainValue = 5;
-        ecoDrainUnit = "days";
-        ecoDrainIntervalSec = 5UL * 24UL * 3600UL;
-        return;
-    }
-    
-    // Lire la valeur
-    uint16_t value = 0;
-    value |= ((uint16_t)EEPROM.read(EEPROM_DRAIN_VALUE)) << 8;
-    value |= ((uint16_t)EEPROM.read(EEPROM_DRAIN_VALUE + 1));
-    
-    // Lire l'unité
-    uint8_t unitCode = EEPROM.read(EEPROM_DRAIN_UNIT);
-    
-    // Valider et appliquer
-    if (unitCode == 1 && value >= 1 && value <= 720) {
-        // Heures
-        ecoDrainUnit = "hours";
-        ecoDrainValue = value;
-        ecoDrainIntervalSec = (uint32_t)value * 3600UL;
-    } else if (unitCode == 0 && value >= 1 && value <= 30) {
-        // Jours
-        ecoDrainUnit = "days";
-        ecoDrainValue = value;
-        ecoDrainIntervalSec = (uint32_t)value * 24UL * 3600UL;
-    } else {
-        // Valeur corrompue, défaut
-        ecoDrainValue = 5;
-        ecoDrainUnit = "days";
-        ecoDrainIntervalSec = 5UL * 24UL * 3600UL;
-    }
-}
-
-
+// Force du Wifi
 int rssiToQuality(int rssiDbm) {
   // approx: -50 dBm => ~100%, -100 dBm => ~0%
   int q = map(constrain(rssiDbm, -100, -50), -100, -50, 0, 100);
@@ -621,232 +765,358 @@ float readUltrasonicCm() {
 }
 
 int cmToPercent(float cm) {
-  float waterHeight = (SENSOR_OFFSET_CM + TANK_HEIGHT_CM) - cm;
-  waterHeight = constrain(waterHeight, 0.0f, TANK_HEIGHT_CM);
-  return (int)round((waterHeight / TANK_HEIGHT_CM) * 100.0f);
+  if (!calibrationDone) {
+    // Utilise les constantes par défaut
+    float waterHeight = (SENSOR_OFFSET_CM + TANK_HEIGHT_CM) - cm;
+    waterHeight = constrain(waterHeight, 0.0f, TANK_HEIGHT_CM);
+    return (int)round((waterHeight / TANK_HEIGHT_CM) * 100.0f);
+  }
+  
+  // Utilise la calibration
+  if (calibZeroCm <= calibFullCm) return 0;  // Erreur calibration
+  
+  float pct = (calibZeroCm - cm) / (calibZeroCm - calibFullCm) * 100.0f;
+  return (int)round(constrain(pct, 0.0f, 100.0f));
+}
+
+void checkPeriodicDrain() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  
+  switch (drainScheduleType) {
+    case DRAIN_DAILY:
+      // Tous les jours à l'heure spécifiée
+      if (timeinfo->tm_hour == drainHour && timeinfo->tm_min == drainMinute) {
+        if (now - lastDrainTimestamp > 3600) {  // Évite double déclenchement
+          drainInProgress = true;
+        }
+      }
+      break;
+      
+    case DRAIN_SPECIFIC_DAYS:
+      {
+        // Jours spécifiques (bit0=Lun, bit6=Dim)
+        int weekday = (timeinfo->tm_wday + 6) % 7;  // Convertir (0=Dim) en (0=Lun)
+        if (drainDays & (1 << weekday)) {
+          if (timeinfo->tm_hour == drainHour && timeinfo->tm_min == drainMinute) {
+            if (now - lastDrainTimestamp > 3600) {
+              drainInProgress = true;
+            }
+          }
+        }
+      }
+      break;
+      
+    case DRAIN_EVERY_X_HOURS:
+      {
+        uint32_t intervalSec = (uint32_t)drainEveryHours * 3600UL;
+        if (now - lastDrainTimestamp >= intervalSec) {
+          drainInProgress = true;
+        }
+      }
+      break;
+  }
+}
+
+void checkDrainTrigger(int levelNow) {
+  if (drainInProgress || manualDrainActive) return;
+  
+  switch (drainMode) {
+    case DRAIN_NEVER:
+      // Pas de vidange automatique
+      break;
+      
+    case DRAIN_AT_LEVEL:
+      // Vidange quand niveau atteint le seuil
+      if (levelNow >= drainAtLevelPct) {
+        drainInProgress = true;
+      }
+      break;
+      
+    case DRAIN_PERIODIC:
+      checkPeriodicDrain();
+      break;
+  }
 }
 
 void runLogic(unsigned long dtMs) {
   unsigned long now = millis();
 
-  // 1) PIR
+  // === 1) Mesures ===
   bool pir = readPir();
   pirState = pir;
   if (pir) {
     fillAllowedUntilMs = now + (unsigned long)MOTION_HOLD_SECONDS * 1000UL;
     lastPirDetectMs = now;
   }
-  bool fillAuthorized = (long)fillAllowedUntilMs - (long)now > 0;
+  bool pirActive = (long)fillAllowedUntilMs - (long)now > 0;
 
-  // 2) Niveau
   readAHT20();
   distanceCm = readUltrasonicCm();
   int levelNow = cmToPercent(distanceCm);
   if (!SIMULATION) levelPct = levelNow;
 
-  // === AJOUTER ICI : Gestion vidange manuelle ===
-  if (manualDrainActive) {
+  // === 2) Fontaine arrêtée : tout OFF ===
+  if (!fountainRunning) {
+    if (valveOn || pumpOn || VoutOn) {
+      valveOn = false;
+      pumpOn = false;
+      VoutOn = false;
+      pulseEV1(false);
+      setPump(false);
+      setEV_out(false);
+    }
+    return;
+  }
+
+  // === 3) Vidange en cours (manuelle ou automatique) ===
+  if (manualDrainActive || drainInProgress) {
     valveOn = false;
     pumpOn = true;
     VoutOn = true;
     
-    // Arrêt automatique si niveau très bas
+    // Arrêt si niveau très bas
     if (levelNow <= 5) {
       manualDrainActive = false;
+      drainInProgress = false;
+      lastDrainTimestamp = (uint32_t)time(nullptr);
+      saveUint32ToEEPROM(EEPROM_LAST_DRAIN, lastDrainTimestamp);
+      EEPROM.commit();
       pumpOn = false;
       VoutOn = false;
     }
     
-    // Appliquer les relais et sortir (priorité sur les modes)
     pulseEV1(valveOn);
     setPump(pumpOn);
     setEV_out(VoutOn);
-    return;  // Ne pas exécuter la logique des modes
+    return;
   }
 
-  // 3) Décisions relais SELON LE MODE
+  // === 4) Vérification déclenchement vidange ===
+  checkDrainTrigger(levelNow);
+
+  // === 5) Logique normale ===
   bool prevValve = valveOn;
-  bool prevPump  = pumpOn;
-  bool prevVout  = VoutOn;
+  bool prevPump = pumpOn;
+  bool prevVout = VoutOn;
 
-  switch (currentMode) {
-    
-    case MODE_OPEN_CYCLE: // Mode actuel
-      if (levelNow >= PUMP_ON_ABOVE){       
-        pumpOn = true;
-        VoutOn = true;
-      }
-      else if (levelNow <= PUMP_OFF_BELOW){
-        pumpOn = false;
-        VoutOn = false;
-      }
-      
-      if (fillAuthorized && levelNow < LEVEL_TARGET_FILL) valveOn = true;
-      else valveOn = false;
-      
+  // --- Source d'eau (EV1) ---
+  switch (waterSource) {
+    case SRC_EXTERNAL:
+      // EV1 ouverte, remplissage depuis l'extérieur
+      valveOn = (levelNow < thresholdMax);
       break;
-
-    case MODE_CLOSED_CYCLE: // Fontaine classique
+      
+    case SRC_INTERNAL:
+      // EV1 fermée, cycle fermé
       valveOn = false;
-      pumpOn = true;
-      VoutOn = false;
+      VoutOn = false;  // Pas d'évacuation
       break;
+      
+    case SRC_AUTO:
+      // Automatique selon les seuils
+      if (levelNow <= thresholdMin) {
+        valveOn = true;   // Ouvrir pour remplir
+      } else if (levelNow >= thresholdMax) {
+        valveOn = false;  // Fermer, assez plein
+      }
+      // Entre les deux : maintenir l'état actuel
+      break;
+  }
 
-    case MODE_ECO_HYBRID:
-  // Phase 1 : Remplissage automatique jusqu'à 90% (sans PIR)
-    if (!ecoInClosedPhase) {
-      if (levelNow < LEVEL_TARGET_FILL) {
-        valveOn = true;
+  // --- Écoulement (Pompe) ---
+  switch (flowMode) {
+    case FLOW_PIR:
+      // Pompe active seulement si PIR détecté récemment
+      if (pirActive && levelNow > thresholdMin) {
+        pumpOn = true;
       } else {
-        valveOn = false;
-        // Basculer en cycle fermé dès que 90% atteint
-        ecoInClosedPhase = true;
-        lastEV1OnTimestamp = (uint32_t)time(nullptr);
-        saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
+        pumpOn = false;
       }
+      break;
       
-      pumpOn = false;
-      VoutOn = false;
-    }
-    // Phase 2 : Cycle fermé + vidange tous les 5 jours
-    else {
-      valveOn = false;
-      pumpOn = true;
-      VoutOn = false;
-      
-      // Vérifier si 5 jours écoulés depuis dernier remplissage
-      uint32_t currentTimestamp = (uint32_t)time(nullptr);
-      // Protection : NTP pas encore synchronisé (timestamp avant 2024)
-      if (currentTimestamp < 1704067200) {  // 1er janvier 2024 00:00:00 UTC
-          // Heure invalide, on reste en cycle fermé sans déclencher vidange
-          break;
-      }
-      uint32_t elapsedSec = currentTimestamp - lastEV1OnTimestamp;
-      
-      if (elapsedSec >= ecoDrainIntervalSec) {
-        // Vidange active
-        pumpOn = true;
-        VoutOn = true;
-        
-        // Condition de sortie : niveau bas (10%)
-        if (levelNow <= 10) {
-          pumpOn = false;
-          VoutOn = false;
-          ecoInClosedPhase = false;
-          lastEV1OnTimestamp = (uint32_t)time(nullptr);
-          saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
-          if (SIMULATION) levelPct = 10;
-        }
-
-      }
-    }
-    break;
+    case FLOW_CONTINUOUS:
+      // Pompe toujours active (sauf si niveau trop bas)
+      pumpOn = (levelNow > thresholdMin);
+      break;
   }
 
-    // Vidange manuelle : force pompe + Vout
-  if (manualDrainActive) {
-    pumpOn = true;
-    VoutOn = true;
-    // Arrêt si niveau ≤ 10%
-    if (levelNow <= 10) {
-      manualDrainActive = false;
-      if (SIMULATION) levelPct = 10;
-    }
+  // --- Arrêts automatiques aux seuils ---
+  // Si source externe : arrêt écoulement quand MAX atteint
+  if (waterSource == SRC_EXTERNAL && levelNow >= thresholdMax) {
+    // On continue la pompe, c'est juste le remplissage qui s'arrête
   }
-
-  // 4) Appliquer les changements
-  if (valveOn != prevValve) {
-    if (valveOn) {
-      pulseEV1(true);
-      lastValveOnMs = now;
-    } else {
-      pulseEV1(false);
-    }
-  } else if (valveOn && lastValveOnMs == 0) {
-    lastValveOnMs = now;
-  }
-
   
-  // Pompe : appliquer si changement
+  // Si source interne : arrêt pompe quand MIN atteint
+  if (waterSource == SRC_INTERNAL && levelNow <= thresholdMin) {
+    pumpOn = false;
+  }
+
+  // --- VoutOn suit pumpOn sauf si source interne ---
+  if (waterSource != SRC_INTERNAL) {
+    VoutOn = pumpOn && valveOn;  // Évacuation si pompe ET remplissage
+  } else {
+    VoutOn = false;  // Cycle fermé, pas d'évacuation
+  }
+
+  // === 6) Appliquer les changements ===
+  if (valveOn != prevValve) {
+    pulseEV1(valveOn);
+    if (valveOn) lastValveOnMs = now;
+  }
   if (pumpOn != prevPump) {
     setPump(pumpOn);
     if (pumpOn) lastPumpOnMs = now;
-  } else if (pumpOn && lastPumpOnMs == 0) {
-    // Pompe déjà ON mais jamais timestampée (démarrage/changement mode)
-    lastPumpOnMs = now;
   }
-
-  // Vout : appliquer si changement
   if (VoutOn != prevVout) {
     setEV_out(VoutOn);
   }
 
-  // 5) Évolution simulation
+  // === Simulation ===
   if (SIMULATION) {
     float dt = dtMs / 1000.0f;
     if (valveOn) levelPct += SIM_FILL_RATE_PCT_S * dt;
-    if (pumpOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * dt;
-    if (VoutOn)  levelPct -= SIM_DRAIN_RATE_PCT_S * 2.0f * dt;
+    if (pumpOn && VoutOn) levelPct -= SIM_DRAIN_RATE_PCT_S * dt;
     levelPct -= SIM_LEAK_RATE_PCT_S * dt;
     levelPct = constrain(levelPct, 0.0f, 100.0f);
   }
 }
 
+void applyPreset(int preset) {
+  switch (preset) {
+    case 0:  // Cycle fermé
+      waterSource = SRC_INTERNAL;
+      flowMode = FLOW_CONTINUOUS;
+      drainMode = DRAIN_NEVER;
+      break;
+      
+    case 1:  // Cycle ouvert
+      waterSource = SRC_EXTERNAL;
+      flowMode = FLOW_PIR;
+      drainMode = DRAIN_AT_LEVEL;
+      drainAtLevelPct = 95;
+      break;
+      
+    case 2:  // Hybride
+      waterSource = SRC_AUTO;
+      flowMode = FLOW_CONTINUOUS;
+      drainMode = DRAIN_PERIODIC;
+      drainScheduleType = DRAIN_DAILY;
+      break;
+      
+    case 3:  // Éco
+      waterSource = SRC_AUTO;
+      flowMode = FLOW_PIR;
+      drainMode = DRAIN_PERIODIC;
+      drainScheduleType = DRAIN_EVERY_X_HOURS;
+      drainEveryHours = 48;
+      break;
+  }
+  saveAllSettingsToEEPROM();
+}
 
 void drawOLED() {
   display.clearDisplay();
 
-  // --- Bandeau Wi-Fi (icône 20x15 + texte 8 px) ---
+  // --- Bandeau Wi-Fi (icône 20x15) ---
   const bool connected = WiFi.isConnected();
   const int  rssi = connected ? WiFi.RSSI() : -100;
-  const int  qual = rssiToQuality(rssi);
   const unsigned char* icon = wifiIconForRSSI(rssi, connected);
 
-  // Icône 20x15 à (0,0) — respecte la contrainte "≤15 px"
+  // Icône 20x15 en haut à droite
   display.drawBitmap(SCREEN_WIDTH - 20, 0, icon, 20, 15, SSD1306_WHITE);
 
-  // --- "eco" en petit en haut à gauche si mode ECO_HYBRID ---
-  if (currentMode == MODE_ECO_HYBRID) {
-    display.setTextSize(1);  // Petit texte (8px hauteur)
-    display.setCursor((SCREEN_WIDTH - 18) / 2, 0); //centré
-    display.print("eco");
-  }
-
-  // --- Image 52x52 en bas à gauche selon le mode ---
-  const unsigned char* modeIcon;
-  if (currentMode == MODE_CLOSED_CYCLE) {
-    modeIcon = bac;  // Cycle fermé
-  } else if (currentMode == MODE_ECO_HYBRID) {
-    // Mode éco : afficher selon la phase
-    if (ecoInClosedPhase) {
-      modeIcon = bac;  // Phase fermée = bac
-    } else {
-      modeIcon = robinet;  // Phase remplissage = robinet
-    }
+  // --- Indicateur ON/OFF en haut à gauche ---
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  if (fountainRunning) {
+    display.print("ON");
   } else {
-    modeIcon = robinet;  // Cycle ouvert
+    display.print("OFF");
+  }
+
+  // --- Affichage du mode actif (si préréglage détecté) ---
+  // Détecte quel préréglage correspond aux options actuelles
+  const char* modeName = nullptr;
+  
+  if (waterSource == SRC_INTERNAL && flowMode == FLOW_CONTINUOUS && drainMode == DRAIN_NEVER) {
+    modeName = "Ferme";
+  } else if (waterSource == SRC_EXTERNAL && flowMode == FLOW_PIR && drainMode == DRAIN_AT_LEVEL) {
+    modeName = "Ouvert";
+  } else if (waterSource == SRC_AUTO && flowMode == FLOW_CONTINUOUS && drainMode == DRAIN_PERIODIC) {
+    modeName = "Hybride";
+  } else if (waterSource == SRC_AUTO && flowMode == FLOW_PIR && drainMode == DRAIN_PERIODIC) {
+    modeName = "Eco";
   }
   
-  // Position : bas gauche (y = 64 - 52 = 12)
-  display.drawBitmap(0, 12, modeIcon, 52, 52, SSD1306_WHITE);
+  // Affiche le nom du mode centré en haut (si détecté)
+  if (modeName != nullptr) {
+    int nameLen = strlen(modeName);
+    int nameWidth = nameLen * 6;  // 6 pixels par caractère en taille 1
+    display.setCursor((SCREEN_WIDTH - nameWidth) / 2, 0);
+    display.print(modeName);
+  }
 
-  // --- Niveau d'eau en petit en bas à droite ---
-  display.setTextSize(2);  // Petit texte (8px hauteur)
+  // --- Image 52x52 selon source d'eau ---
+  const unsigned char* srcIcon;
   
-  // Créer le texte du niveau
+  switch (waterSource) {
+    case SRC_EXTERNAL:
+      srcIcon = robinet;  // Source externe = robinet
+      break;
+    case SRC_INTERNAL:
+      srcIcon = bac;      // Source interne = bac
+      break;
+    case SRC_AUTO:
+    default:
+      // En mode auto : affiche selon l'état actuel de EV1
+      if (valveOn) {
+        srcIcon = robinet;  // EV1 ouverte = remplissage externe
+      } else {
+        srcIcon = bac;      // EV1 fermée = cycle interne
+      }
+      break;
+  }
+
+  // Position : bas gauche (y = 64 - 52 = 12)
+  display.drawBitmap(0, 12, srcIcon, 52, 52, SSD1306_WHITE);
+
+  // --- Niveau d'eau en bas à droite ---
+  display.setTextSize(2);
+
   char levelText[8];
   snprintf(levelText, sizeof(levelText), "%d%%", (int)round(levelPct));
-  
-  // Calculer largeur approximative du texte (6 pixels par caractère en taille 1)
-  int textWidth = strlen(levelText) * 12;
-  
-  // Position : à droite de l'image du mode
-  display.setCursor(SCREEN_WIDTH - textWidth - 20, SCREEN_HEIGHT - 20);
+
+  int textWidth = strlen(levelText) * 12;  // 12 pixels par caractère en taille 2
+  display.setCursor(SCREEN_WIDTH - textWidth, SCREEN_HEIGHT - 20);
   display.print(levelText);
+
+  // --- Indicateurs d'état (petits, entre l'icône et le niveau) ---
+  display.setTextSize(1);
+  int rightCol = 56;  // À droite de l'icône 52px
+  
+  // Pompe
+  display.setCursor(rightCol, 16);
+  display.print("P:");
+  display.print(pumpOn ? "ON" : "--");
+  
+  // Écoulement (PIR ou continu)
+  display.setCursor(rightCol, 26);
+  if (flowMode == FLOW_PIR) {
+    display.print("PIR:");
+    display.print(pirState ? "!" : "-");
+  } else {
+    display.print("Cont");
+  }
+  
+  // Vidange en cours
+  if (drainInProgress || manualDrainActive) {
+    display.setCursor(rightCol, 36);
+    display.print("DRAIN");
+  }
 
   display.display();
 }
-
 
 String uptimeStr() {
   uint32_t s = millis()/1000;
@@ -874,48 +1144,54 @@ String agoFrom(unsigned long whenMs) {
 }
 
 String statusJson() {
-  // JSON sans ArduinoJson pour rester léger
-  char buf[512];
-  bool fillAuth = (long)fillAllowedUntilMs - (long)millis() > 0;
+  char buf[700];
   
   String sincePir = agoFrom(lastPirDetectMs);
-  String lastValveOnAgo = agoFrom(lastValveOnMs);
-  String lastPumpOnAgo  = agoFrom(lastPumpOnMs);
-String nextDrain = "--:--:--";
-  if (currentMode == MODE_ECO_HYBRID && lastEV1OnTimestamp > 0) {
-    uint32_t currentTime = (uint32_t)time(nullptr);
-    uint32_t elapsed = currentTime - lastEV1OnTimestamp;
+  
+  // Calcul prochaine vidange
+  String nextDrain = "";
+  if (drainMode == DRAIN_PERIODIC && lastDrainTimestamp > 0) {
+    uint32_t now = (uint32_t)time(nullptr);
+    uint32_t interval = 0;
     
-    if (elapsed < ecoDrainIntervalSec) {
-      uint32_t remaining = ecoDrainIntervalSec - elapsed;
-      nextDrain = fmtHMS(remaining);
-    } else {
-      nextDrain = "00:00:00"; // Vidange due
+    if (drainScheduleType == DRAIN_EVERY_X_HOURS) {
+      interval = (uint32_t)drainEveryHours * 3600UL;
+      uint32_t elapsed = now - lastDrainTimestamp;
+      if (elapsed < interval) {
+        nextDrain = fmtHMS(interval - elapsed);
+      }
     }
   }
-
+  
+  // Heure actuelle
+  struct tm timeinfo;
+  char timeStr[6] = "--:--";
+  if (getLocalTime(&timeinfo)) {
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  }
+  
   snprintf(buf, sizeof(buf),
-    "{"
-      "\"level\":%d,"
-      "\"distance\":%.1f,"
-      "\"temp\":%.1f,"
-      "\"hum\":%.0f,"
-      "\"pir\":%d,"
-      "\"valve\":%d,"
-      "\"pump\":%d,"
-      "\"sincePir\":\"%s\","
-      "\"lastValveOnAgo\":\"%s\","
-      "\"lastPumpOnAgo\":\"%s\","
-      "\"uptime\":\"%s\","
-      "\"mode\":%d,"
-      "\"ecoInClosedPhase\":%d,"
-      "\"ecoDrainValue\":%u,"
-      "\"ecoDrainUnit\":\"%s\","
-      "\"nextDrain\":\"%s\","     // Virgule supprimée ici
-      "\"manualDrain\":%s" 
-    "}",
-    (int)round(levelPct), distanceCm, temperatureC, humidityPct, pirState?1:0, valveOn?1:0, pumpOn?1:0, sincePir.c_str(), lastValveOnAgo.c_str(), lastPumpOnAgo.c_str(), uptimeStr().c_str(), currentMode, ecoInClosedPhase?1:0, ecoDrainValue, ecoDrainUnit.c_str(), nextDrain.c_str(),(manualDrainActive ? "true" : "false")
+    "{\"level\":%.1f,\"temp\":%.1f,\"hum\":%.1f,\"dist\":%.1f,"
+    "\"valve\":%s,\"pump\":%s,\"vout\":%s,\"pir\":%s,"
+    "\"running\":%s,\"waterSource\":%d,\"flowMode\":%d,\"drainMode\":%d,"
+    "\"threshMin\":%d,\"threshMax\":%d,"
+    "\"calib0\":%.1f,\"calib100\":%.1f,"
+    "\"drainAtLevel\":%d,\"drainInProgress\":%s,"
+    "\"sincePir\":\"%s\",\"nextDrain\":\"%s\",\"time\":\"%s\"}",
+    levelPct, temperatureC, humidityPct, distanceCm,
+    valveOn ? "true" : "false",
+    pumpOn ? "true" : "false",
+    VoutOn ? "true" : "false",
+    pirState ? "true" : "false",
+    fountainRunning ? "true" : "false",
+    (int)waterSource, (int)flowMode, (int)drainMode,
+    thresholdMin, thresholdMax,
+    calibZeroCm, calibFullCm,
+    drainAtLevelPct,
+    (drainInProgress || manualDrainActive) ? "true" : "false",
+    sincePir.c_str(), nextDrain.c_str(), timeStr
   );
+  
   return String(buf);
 }
 
@@ -959,16 +1235,14 @@ void pushToGoogleSheet() {
 }
 
 
+// ================================================= Setup =====================================================
 
-// ===================== Setup & Loop =====================
 void setup() {
   Serial.begin(115200);
 
   // ========== Initialisation EEPROM ==========
   EEPROM.begin(EEPROM_SIZE);
-  currentMode = loadModeFromEEPROM();
-  lastEV1OnTimestamp = loadEV1TimestampFromEEPROM();
-  loadDrainIntervalFromEEPROM();
+  loadAllSettingsFromEEPROM();
 
   // ========== Détection GPIO0 (bouton BOOT) ==========
   pinMode(0, INPUT_PULLUP);
@@ -1070,95 +1344,152 @@ void setup() {
   });
   server.addHandler(&events);
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request){
-    request->send(200, "text/html; charset=utf-8", FPSTR(index_html));
+  // endpoints serveur
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){
+    r->send(200, "text/html", index_html);
   });
 
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* request){
-    String js = statusJson();
-    request->send(200, "application/json", js);
+  server.on("/power", HTTP_GET, [](AsyncWebServerRequest* r){
+    fountainRunning = !fountainRunning;
+    saveAllSettingsToEEPROM();
+    r->send(200, "text/plain", fountainRunning ? "ON" : "OFF");
   });
 
-  server.on("/setmode", HTTP_GET, [](AsyncWebServerRequest* request){
-  if (request->hasParam("mode")) {
-    int m = request->getParam("mode")->value().toInt();
-    if (m >= 0 && m <= 2) {
-      currentMode = (FountainMode)m;
-      // Sauvegarde en EEPROM
-        saveModeToEEPROM(currentMode);
-
-      // Réinitialiser les états du mode Eco si on change
-      if (currentMode != MODE_ECO_HYBRID) {
-        ecoInClosedPhase = false;
+  server.on("/setsource", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("v")) {
+      int v = r->getParam("v")->value().toInt();
+      if (v >= 0 && v <= 2) {
+        waterSource = (WaterSource)v;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "OK");
+        return;
       }
-      if (currentMode == MODE_ECO_HYBRID) {
-        // Réinitialiser le cycle Eco (nouveau départ)
-        ecoInClosedPhase = true;
-        lastEV1OnTimestamp = (uint32_t)time(nullptr);
-        saveEV1TimestampToEEPROM(lastEV1OnTimestamp);
-      }
-      
-      // NOUVEAU : Forcer un état propre lors du changement de mode
-      valveOn = false;
-      pumpOn = false;
-      VoutOn = false;
-      pulseEV1(false);
-      setPump(false);
-      setEV_out(false);
-      
-      request->send(200, "text/plain", "Mode changé");
-    } else {
-      request->send(400, "text/plain", "Mode invalide");
     }
-  } else {
-    request->send(400, "text/plain", "Paramètre manquant");
-  }
-});
-
-server.on("/setinterval", HTTP_GET, [](AsyncWebServerRequest *req){
-    if (req->hasParam("value") && req->hasParam("unit")) {
-      int value = req->getParam("value")->value().toInt();
-      String unit = req->getParam("unit")->value();
-      
-      if (unit == "hours") {
-        if (value >= 1 && value <= 720) {
-          ecoDrainIntervalSec = (uint32_t)value * 3600UL;
-          ecoDrainValue = value;
-          ecoDrainUnit = "hours";
-          saveDrainIntervalToEEPROM();
-          req->send(200, "text/plain", "OK");
-        } else {
-          req->send(400, "text/plain", "heures entre 1-720");
-        }
-      } else if (unit == "days") {
-        if (value >= 1 && value <= 30) {
-          ecoDrainIntervalSec = (uint32_t)value * 24UL * 3600UL;
-          ecoDrainValue = value;
-          ecoDrainUnit = "days";
-          saveDrainIntervalToEEPROM();
-          req->send(200, "text/plain", "OK");
-        } else {
-          req->send(400, "text/plain", "jours entre 1-30");
-        }
-      } else {
-        req->send(400, "text/plain", "unit invalide");
-      }
-    } else {
-      req->send(400, "text/plain", "Params manquants");
-    }
+    r->send(400, "text/plain", "Invalid");
   });
 
-  // Démarrer vidange manuelle
-  server.on("/drain", HTTP_GET, [](AsyncWebServerRequest *req){
+  server.on("/setflow", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("v")) {
+      int v = r->getParam("v")->value().toInt();
+      if (v >= 0 && v <= 1) {
+        flowMode = (FlowMode)v;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    r->send(400, "text/plain", "Invalid");
+  });
+
+  server.on("/setdrain", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("v")) {
+      int v = r->getParam("v")->value().toInt();
+      if (v >= 0 && v <= 2) {
+        drainMode = (DrainMode)v;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    r->send(400, "text/plain", "Invalid");
+  });
+
+  server.on("/setthresh", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("min") && r->hasParam("max")) {
+      int mn = r->getParam("min")->value().toInt();
+      int mx = r->getParam("max")->value().toInt();
+      if (mn >= 5 && mn <= 50 && mx >= 50 && mx <= 100 && mn < mx) {
+        thresholdMin = mn;
+        thresholdMax = mx;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    r->send(400, "text/plain", "Invalid");
+  });
+
+  server.on("/setdrainsched", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("type")) {
+      int t = r->getParam("type")->value().toInt();
+      if (t >= 0 && t <= 2) {
+        drainScheduleType = (DrainScheduleType)t;
+        
+        if (r->hasParam("time")) {
+          String time = r->getParam("time")->value();
+          int h = time.substring(0,2).toInt();
+          int m = time.substring(3,5).toInt();
+          drainHour = constrain(h, 0, 23);
+          drainMinute = constrain(m, 0, 59);
+        }
+        
+        if (r->hasParam("days")) {
+          drainDays = r->getParam("days")->value().toInt() & 0x7F;
+        }
+        
+        if (r->hasParam("hours")) {
+          drainEveryHours = constrain(r->getParam("hours")->value().toInt(), 1, 720);
+        }
+        
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    r->send(400, "text/plain", "Invalid");
+  });
+
+  server.on("/setdrainlevel", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("v")) {
+      int v = r->getParam("v")->value().toInt();
+      if (v >= 50 && v <= 100) {
+        drainAtLevelPct = v;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    r->send(400, "text/plain", "Invalid");
+  });
+
+  server.on("/drain", HTTP_GET, [](AsyncWebServerRequest* r){
     manualDrainActive = true;
-    req->send(200, "text/plain", "Vidange démarrée");
+    r->send(200, "text/plain", "Drain started");
   });
 
-  // Arrêter vidange manuelle
-  server.on("/stopdrain", HTTP_GET, [](AsyncWebServerRequest *req){
-    manualDrainActive = false;
-    req->send(200, "text/plain", "Vidange arrêtée");
+  server.on("/calibrate", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("pct")) {
+      int pct = r->getParam("pct")->value().toInt();
+      if (pct == 0) {
+        calibZeroCm = distanceCm;
+        calibrationDone = true;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "0% calibrated");
+      } else if (pct == 100) {
+        calibFullCm = distanceCm;
+        calibrationDone = true;
+        saveAllSettingsToEEPROM();
+        r->send(200, "text/plain", "100% calibrated");
+      } else {
+        r->send(400, "text/plain", "Use 0 or 100");
+      }
+      return;
+    }
+    r->send(400, "text/plain", "Missing pct");
   });
+
+  server.on("/preset", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("v")) {
+      int v = r->getParam("v")->value().toInt();
+      if (v >= 0 && v <= 3) {
+        applyPreset(v);
+        r->send(200, "text/plain", "Preset applied");
+        return;
+      }
+    }
+    r->send(400, "text/plain", "Invalid");
+  });
+
 
   server.begin();
 
@@ -1172,6 +1503,8 @@ server.on("/setinterval", HTTP_GET, [](AsyncWebServerRequest *req){
   pushToGoogleSheet();
 
 }
+
+// ================================================= Loop =====================================================
 
 void loop() {
   unsigned long now = millis();
