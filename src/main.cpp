@@ -30,7 +30,7 @@ enum WaterSource { SRC_EXTERNAL, SRC_INTERNAL, SRC_AUTO };
 WaterSource waterSource = SRC_AUTO;  // Défaut: auto
 
 // === Option: Écoulement ===
-enum FlowMode { FLOW_PIR, FLOW_CONTINUOUS };
+enum FlowMode { FLOW_PIR, FLOW_CONTINUOUS, FLOW_ADAPTIVE };
 FlowMode flowMode = FLOW_CONTINUOUS;  // Défaut: continu
 
 // === Option: Vidange ===
@@ -123,8 +123,8 @@ Adafruit_AHTX0 aht;
 const int PIN_ECHO  = 12;   // HC-SR04 ECHO (si réel)
 const int PIN_TRIG  = 13;   // HC-SR04 TRIG (si réel)
 const int PIN_PIR   = 14;   // SR602 (si réel)
-const int PIN_VALVE = 18;   // Relais EV_out
-const int PIN_PUMP  = 19;   // Relais pompe + ancienne EV
+const int PIN_VALVE = 18;   // Relais EV_vidange
+const int PIN_PUMP  = 19;   // Relais pompe
 const bool ACTIVE_LOW = true; // true si relais actifs à LOW
 const int PIN_EV1_AIN1 = 33; // EV1
 const int PIN_EV1_AIN2 = 32;
@@ -170,6 +170,10 @@ bool ahtOk = false;
 bool valveOn = false;
 bool pumpOn  = false;
 bool VoutOn = false;
+bool prevValve = false;
+bool prevPump = false;
+bool prevVout = false;
+
 
 unsigned long fillAllowedUntilMs = 0; // fenêtre d'autorisation de remplissage
 unsigned long pirSimUntilMs      = 0; // fenêtre d'un burst PIR simulé
@@ -178,6 +182,8 @@ bool pirState = false;                // état instantané du PIR (affichage)
 unsigned long lastPirDetectMs = 0; // dernière détection PIR (instant)
 unsigned long lastValveOnMs   = 0; // dernier passage vanne -> ON
 unsigned long lastPumpOnMs    = 0; // dernier passage pompe -> ON
+
+int effectiveSource = SRC_EXTERNAL; // source de l'eau ext/int
 
 // ===================== Web server (Async) =====================
 AsyncWebServer server(80);
@@ -192,7 +198,7 @@ static const char index_html[] PROGMEM = R"HTML(
 <style>
 :root{font:14px system-ui,Segoe UI,Roboto,Ubuntu,Arial}
 body{margin:0;background:#0b1220;color:#e8eefc}
-header{padding:12px 16px;background:#0f172a;position:sticky;top:0;display:flex;justify-content:space-between;align-items:center}
+header{padding:6px 16px;background:#0f172a;position:sticky;top:0;display:flex;justify-content:space-between;align-items:center;z-index:100}
 main{padding:16px;max-width:900px;margin:auto}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
 .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
@@ -243,10 +249,14 @@ label{display:flex;align-items:center;gap:8px;cursor:pointer}
 </head>
 <body>
 <header>
-  <strong>Fontaine</strong>
+  <h2><strong>Fontaine</strong></h2>
   <div class="row">
     <span id="clock">--:--</span>
-    <button id="powerBtn" class="btn power-btn off" onclick="togglePower()">⏻</button>
+    <button class="btn btn-power" id="powerBtn" onclick="togglePower()">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 2v10M18.4 6.6a9 9 0 1 1-12.8 0"/>
+      </svg>
+    </button>
   </div>
 </header>
 
@@ -257,13 +267,27 @@ label{display:flex;align-items:center;gap:8px;cursor:pointer}
       <div class="status-item"><div class="val" id="level">--</div><div class="lbl">Niveau %</div></div>
       <div class="status-item"><div class="val" id="temp">--</div><div class="lbl">Temp °C</div></div>
       <div class="status-item"><div class="val" id="hum">--</div><div class="lbl">Humidité %</div></div>
-      <div class="status-item"><div class="val" id="ev1">--</div><div class="lbl">EV1</div></div>
+      <div class="status-item"><div class="val" id="ev1">--</div><div class="lbl">EV</div></div>
       <div class="status-item"><div class="val" id="pump">--</div><div class="lbl">Pompe</div></div>
       <div class="status-item"><div class="val" id="vout">--</div><div class="lbl">Évac.</div></div>
     </div>
   </div>
 
   <div class="grid">
+    <!-- Préréglages -->
+    <div class="card">
+      <h3>⚡ Préréglages Cycle</h3>
+      <div class="presets">
+        <button class="btn btn-secondary" onclick="applyPreset(0)">Fermé</button>
+        <button class="btn btn-secondary" onclick="applyPreset(1)">Ouvert</button>
+        <button class="btn btn-secondary" onclick="applyPreset(2)">Hybride</button>
+        <button class="btn btn-secondary" onclick="applyPreset(3)">Éco</button>
+      </div>
+      <p style="font-size:11px;opacity:.6;margin-top:8px">
+        Les préréglages modifient les options.
+      </p>
+    </div>
+
     <!-- Source d'eau -->
     <div class="card">
       <h3>💧 Source d'eau</h3>
@@ -288,6 +312,7 @@ label{display:flex;align-items:center;gap:8px;cursor:pointer}
       <div class="btn-group">
         <button class="btn" data-flow="0" onclick="setFlow(0)">PIR</button>
         <button class="btn" data-flow="1" onclick="setFlow(1)">Continu</button>
+        <button class="btn" data-flow="2" onclick="setFlow(2)">Adaptatif</button>
       </div>
       <div class="row" style="margin-top:8px">
         <span class="pill">PIR: <span id="pirStatus">--</span></span>
@@ -367,19 +392,6 @@ label{display:flex;align-items:center;gap:8px;cursor:pointer}
       </div>
     </div>
 
-    <!-- Préréglages -->
-    <div class="card">
-      <h3>⚡ Préréglages rapides</h3>
-      <div class="presets">
-        <button class="btn btn-secondary" onclick="applyPreset(0)">Cycle fermé</button>
-        <button class="btn btn-secondary" onclick="applyPreset(1)">Cycle ouvert</button>
-        <button class="btn btn-secondary" onclick="applyPreset(2)">Hybride</button>
-        <button class="btn btn-secondary" onclick="applyPreset(3)">Éco</button>
-      </div>
-      <p style="font-size:11px;opacity:.6;margin-top:8px">
-        Les préréglages modifient les options ci-dessus selon des configurations typiques.
-      </p>
-    </div>
   </div>
 </main>
 
@@ -416,6 +428,27 @@ es.onmessage = e => {
     updateSourceUI(d.waterSource);
     updateFlowUI(d.flowMode);
     updateDrainModeUI(d.drainMode);
+
+    // Synchroniser les sous-options de vidange périodique
+    if (d.drainSchedType !== undefined) {
+      $('drainSchedule').value = d.drainSchedType;
+      updateDrainUI();
+    }
+    if (d.drainHour !== undefined && d.drainMinute !== undefined) {
+      const h = String(d.drainHour).padStart(2, '0');
+      const m = String(d.drainMinute).padStart(2, '0');
+      $('drainTime').value = h + ':' + m;
+    }
+    if (d.drainDays !== undefined) {
+      document.querySelectorAll('[name="day"]').forEach(cb => {
+        const bit = 1 << parseInt(cb.value);
+        cb.checked = (d.drainDays & bit) !== 0;
+      });
+    }
+    if (d.drainEveryHours !== undefined) {
+      $('drainHours').value = d.drainEveryHours;
+    }
+
     
     $('threshMin').value = d.threshMin || 25;
     $('threshMax').value = d.threshMax || 90;
@@ -451,8 +484,12 @@ function updateDrainModeUI(mode) {
   document.querySelectorAll('[data-drain]').forEach(b => {
     b.classList.toggle('active', parseInt(b.dataset.drain) === mode);
   });
-  $('drainPeriodicOpts').classList.toggle('hidden', mode !== 1);
-  $('drainLevelOpts').classList.toggle('hidden', mode !== 2);
+  
+  const periodicOpts = $('drainPeriodicOpts');
+  const levelOpts = $('drainLevelOpts');
+  
+  if (periodicOpts) periodicOpts.classList.toggle('hidden', mode !== 1);
+  if (levelOpts) levelOpts.classList.toggle('hidden', mode !== 2);
 }
 
 function updateDrainUI() {
@@ -865,6 +902,9 @@ void runLogic(unsigned long dtMs) {
       pulseEV1(false);
       setPump(false);
       setEV_out(false);
+      prevValve = false;
+      prevPump = false;
+      prevVout = false;
     }
     return;
   }
@@ -895,71 +935,71 @@ void runLogic(unsigned long dtMs) {
   // === 4) Vérification déclenchement vidange ===
   checkDrainTrigger(levelNow);
 
-  // === 5) Logique normale ===
-  bool prevValve = valveOn;
-  bool prevPump = pumpOn;
-  bool prevVout = VoutOn;
-
-  // --- Source d'eau (EV1) ---
-  switch (waterSource) {
-    case SRC_EXTERNAL:
-      // EV1 ouverte, remplissage depuis l'extérieur
-      valveOn = (levelNow < thresholdMax);
-      break;
-      
-    case SRC_INTERNAL:
-      // EV1 fermée, cycle fermé
-      valveOn = false;
-      VoutOn = false;  // Pas d'évacuation
-      break;
-      
-    case SRC_AUTO:
-      // Automatique selon les seuils
-      if (levelNow <= thresholdMin) {
-        valveOn = true;   // Ouvrir pour remplir
-      } else if (levelNow >= thresholdMax) {
-        valveOn = false;  // Fermer, assez plein
-      }
-      // Entre les deux : maintenir l'état actuel
-      break;
+  // --- Déterminer la source effective (pour SRC_AUTO) ---
+  
+  if (waterSource == SRC_AUTO) {
+    // Bascule en externe si niveau <= MIN
+    if (levelNow <= thresholdMin) {
+      effectiveSource = SRC_EXTERNAL;
+    }
+    // Bascule en interne si niveau >= MAX
+    else if (levelNow >= thresholdMax) {
+      effectiveSource = SRC_INTERNAL;
+    }
+    // Entre les deux : on garde l'état précédent (hystérésis)
+  } else {
+    effectiveSource = waterSource;
   }
 
-  // --- Écoulement (Pompe) ---
+    // --- Déterminer si écoulement demandé ---
+  bool wantFlow = false;
   switch (flowMode) {
     case FLOW_PIR:
-      // Pompe active seulement si PIR détecté récemment
-      if (pirActive && levelNow > thresholdMin) {
-        pumpOn = true;
-      } else {
-        pumpOn = false;
-      }
+      wantFlow = pirActive;
       break;
-      
     case FLOW_CONTINUOUS:
-      // Pompe toujours active (sauf si niveau trop bas)
-      pumpOn = (levelNow > thresholdMin);
+      wantFlow = true;
       break;
+    case FLOW_ADAPTIVE:
+    // PIR si source externe, continu si source interne
+    if (effectiveSource == SRC_EXTERNAL) {
+      wantFlow = pirActive;
+    } else {
+      wantFlow = true;  // SRC_INTERNAL = continu
+    }
+    break;
   }
 
-  // --- Arrêts automatiques aux seuils ---
-  // Si source externe : arrêt écoulement quand MAX atteint
-  if (waterSource == SRC_EXTERNAL && levelNow >= thresholdMax) {
-    // On continue la pompe, c'est juste le remplissage qui s'arrête
-  }
-  
-  // Si source interne : arrêt pompe quand MIN atteint
-  if (waterSource == SRC_INTERNAL && levelNow <= thresholdMin) {
-    pumpOn = false;
+  // --- Appliquer la logique selon source effective ---
+  valveOn = false;
+  pumpOn = false;
+  VoutOn = false;  // VoutOn = vidange uniquement, pas ici
+
+  if (wantFlow) {
+    switch (effectiveSource) {
+      case SRC_EXTERNAL:
+        // Eau vient de l'extérieur via EV1
+        // Ouvrir vanne SI niveau < MAX
+        if (levelNow < thresholdMax) {
+          valveOn = true;
+        }
+        // Pompe OFF (pas besoin, l'eau coule par gravité/pression)
+        pumpOn = false;
+        break;
+        
+      case SRC_INTERNAL:
+        // Cycle fermé, eau recyclée par la pompe
+        // Vanne toujours fermée
+        valveOn = false;
+        // Pompe ON SI niveau > MIN (assez d'eau pour pomper)
+        if (levelNow > thresholdMin) {
+          pumpOn = true;
+        }
+        break;
+    }
   }
 
-  // --- VoutOn suit pumpOn sauf si source interne ---
-  if (waterSource != SRC_INTERNAL) {
-    VoutOn = pumpOn && valveOn;  // Évacuation si pompe ET remplissage
-  } else {
-    VoutOn = false;  // Cycle fermé, pas d'évacuation
-  }
-
-  // === 6) Appliquer les changements ===
+  // --- Appliquer les sorties si changement ---
   if (valveOn != prevValve) {
     pulseEV1(valveOn);
     if (valveOn) lastValveOnMs = now;
@@ -971,6 +1011,10 @@ void runLogic(unsigned long dtMs) {
   if (VoutOn != prevVout) {
     setEV_out(VoutOn);
   }
+
+  prevValve = valveOn;
+  prevPump = pumpOn;
+  prevVout = VoutOn;
 
   // === Simulation ===
   if (SIMULATION) {
@@ -999,7 +1043,7 @@ void applyPreset(int preset) {
       
     case 2:  // Hybride
       waterSource = SRC_AUTO;
-      flowMode = FLOW_CONTINUOUS;
+      flowMode = FLOW_ADAPTIVE;
       drainMode = DRAIN_PERIODIC;
       drainScheduleType = DRAIN_DAILY;
       break;
@@ -1008,8 +1052,8 @@ void applyPreset(int preset) {
       waterSource = SRC_AUTO;
       flowMode = FLOW_PIR;
       drainMode = DRAIN_PERIODIC;
-      drainScheduleType = DRAIN_EVERY_X_HOURS;
-      drainEveryHours = 48;
+      drainScheduleType = DRAIN_SPECIFIC_DAYS;
+      drainDays = 0b0010010; // Mardi et Vendredi
       break;
   }
   saveAllSettingsToEEPROM();
@@ -1070,7 +1114,7 @@ void drawOLED() {
     case SRC_AUTO:
     default:
       // En mode auto : affiche selon l'état actuel de EV1
-      if (valveOn) {
+      if (cmToPercent(readUltrasonicCm()) <= thresholdMin) {
         srcIcon = robinet;  // EV1 ouverte = remplissage externe
       } else {
         srcIcon = bac;      // EV1 fermée = cycle interne
@@ -1102,11 +1146,22 @@ void drawOLED() {
   
   // Écoulement (PIR ou continu)
   display.setCursor(rightCol, 26);
-  if (flowMode == FLOW_PIR) {
-    display.print("PIR:");
-    display.print(pirState ? "!" : "-");
-  } else {
-    display.print("Cont");
+  switch (flowMode) {
+    case FLOW_PIR:
+      display.print("PIR:");
+      display.print(pirState ? "!" : "-");
+      break;
+    case FLOW_CONTINUOUS:
+      display.print("Cont");
+      break;
+    case FLOW_ADAPTIVE:
+      display.print("Adp:");
+      if (effectiveSource == SRC_EXTERNAL) {
+        display.print(pirState ? "!" : "-");
+      } else {
+        display.print("C");
+      }
+      break;
   }
   
   // Vidange en cours
@@ -1174,6 +1229,7 @@ String statusJson() {
     "{\"level\":%.1f,\"temp\":%.1f,\"hum\":%.1f,\"dist\":%.1f,"
     "\"valve\":%s,\"pump\":%s,\"vout\":%s,\"pir\":%s,"
     "\"running\":%s,\"waterSource\":%d,\"flowMode\":%d,\"drainMode\":%d,"
+    "\"drainSchedType\":%d,\"drainHour\":%d,\"drainMinute\":%d,\"drainDays\":%d,\"drainEveryHours\":%d,"
     "\"threshMin\":%d,\"threshMax\":%d,"
     "\"calib0\":%.1f,\"calib100\":%.1f,"
     "\"drainAtLevel\":%d,\"drainInProgress\":%s,"
@@ -1185,6 +1241,7 @@ String statusJson() {
     pirState ? "true" : "false",
     fountainRunning ? "true" : "false",
     (int)waterSource, (int)flowMode, (int)drainMode,
+    (int)drainScheduleType, drainHour, drainMinute, drainDays, drainEveryHours,
     thresholdMin, thresholdMax,
     calibZeroCm, calibFullCm,
     drainAtLevelPct,
