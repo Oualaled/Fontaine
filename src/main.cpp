@@ -252,7 +252,7 @@ label{display:flex;align-items:center;gap:8px;cursor:pointer}
   <h2><strong>Fontaine</strong></h2>
   <div class="row">
     <span id="clock">--:--</span>
-    <button class="btn btn-power" id="powerBtn" onclick="togglePower()">
+    <button class="btn power-btn" id="powerBtn" onclick="togglePower()">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M12 2v10M18.4 6.6a9 9 0 1 1-12.8 0"/>
       </svg>
