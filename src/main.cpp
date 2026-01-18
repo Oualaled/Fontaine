@@ -1087,7 +1087,7 @@ void drawOLED() {
     modeName = "Ferme";
   } else if (waterSource == SRC_EXTERNAL && flowMode == FLOW_PIR && drainMode == DRAIN_AT_LEVEL) {
     modeName = "Ouvert";
-  } else if (waterSource == SRC_AUTO && flowMode == FLOW_CONTINUOUS && drainMode == DRAIN_PERIODIC) {
+  } else if (waterSource == SRC_AUTO && flowMode == FLOW_ADAPTIVE && drainMode == DRAIN_PERIODIC) {
     modeName = "Hybride";
   } else if (waterSource == SRC_AUTO && flowMode == FLOW_PIR && drainMode == DRAIN_PERIODIC) {
     modeName = "Eco";
